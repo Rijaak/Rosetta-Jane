@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Never commit these: keys, peer address lists, model slices
+secret*.txt
+rosetta-jane-data/
+jane-train-run/
+jane-train-worker/
+plan*.json
+*.jsonl
+peers.json
+device.key
+known-answers-*
+
+# Android build output and machine-specific settings
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# Signing keys and their passwords never belong in the repository
+*.jks
+*.keystore
+PASSWORD.txt
+control-token

@@ -1,0 +1,91 @@
+plugins {
+    id "com.android.application"
+    id "com.chaquo.python"
+}
+
+// The app runs the same Python code as the desktop program. Only the files that work
+// without PyTorch are copied in; a test in the main project keeps them that way.
+def pyStaging = layout.buildDirectory.dir("pysrc")
+tasks.register("stagePython", Sync) {
+    from("../..") {
+        include "rosetta_jane/__init__.py"
+        include "rosetta_jane/net.py"
+        include "rosetta_jane/routing.py"
+        include "rosetta_jane/arrays.py"
+        include "rosetta_jane/swarm.py"
+        include "rosetta_jane/control.py"
+        include "rosetta_jane/scoring.py"
+        include "rosetta_jane/scorebook.py"
+        include "rosetta_jane/handoff.py"
+        include "rosetta_jane/lan/__init__.py"
+        include "rosetta_jane/lan/protocol.py"
+        include "rosetta_jane/mobile/*.py"
+    }
+    into pyStaging
+}
+
+android {
+    namespace "org.rosettajane.app"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "org.rosettajane.app"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    // A release is signed with a key only its publisher holds. The key file and its passwords are
+    // never kept in this project: pass them when building (see android/README.md).
+    def keyFile = providers.gradleProperty("RJ_KEYSTORE").orNull
+    signingConfigs {
+        if (keyFile) {
+            release {
+                storeFile file(keyFile)
+                storePassword providers.gradleProperty("RJ_KEYSTORE_PASSWORD").get()
+                keyAlias providers.gradleProperty("RJ_KEY_ALIAS").getOrElse("rosetta-jane")
+                keyPassword providers.gradleProperty("RJ_KEYSTORE_PASSWORD").get()
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (keyFile) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+    lint {
+        abortOnError false
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version "3.13"
+        pip {
+            install "numpy==1.26.2"
+            install "regex"
+            install "jinja2"
+        }
+    }
+    sourceSets {
+        main {
+            srcDir pyStaging
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name.startsWith("merge") && task.name.endsWith("PythonSources")) {
+        task.dependsOn("stagePython")
+    }
+}
