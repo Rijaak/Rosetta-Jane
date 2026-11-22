@@ -8,7 +8,7 @@ Rosetta-Jane is a companion to [Project NOMAD](https://github.com/Crosstalk-Solu
 
 ## Status: early, and not yet run on real hardware
 
-**Tested** (160 automated tests, tiny random models, CPU only, real network connections on one machine):
+**Tested** (166 automated tests, tiny random models, CPU only, real network connections on one machine):
 
 - Text produced through a chain of peers matches the whole model on one machine, token for token, and the scores behind every token match too.
 - That holds when the route uses only part of a peer's layers, and when a peer dies mid-answer and others take over.
@@ -73,11 +73,33 @@ A group code works like a co-op game lobby. Everyone who enters the same code is
 
 ## Install
 
-Python 3.13 or newer. From the project folder:
+Python 3.13 or newer.
+
+**The easy way.** Download the Linux or Windows package from the [releases page](https://github.com/Rijaak/Rosetta-Jane/releases), unpack it and run its installer. It installs for your user only, asks which graphics card the machine has, and downloads only what that card needs. The Windows package has not been tried on Windows yet.
+
+**From the source.** In the project folder:
 
 ```bash
 pip install .
 ```
+
+That downloads the standard PyTorch, which on Linux includes NVIDIA's libraries (about 5.5 GB installed) whether or not the machine has an NVIDIA card. To get a different build, install PyTorch first and then run `pip install .`:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu      # no graphics card: small
+pip install torch --index-url https://download.pytorch.org/whl/cu126    # GTX 10-series and older NVIDIA cards
+```
+
+**Graphics cards.**
+
+- What gets installed depends on the maker and age of the cards, not on each card. One install drives every card it supports, side by side, including cards from different generations.
+- **Older NVIDIA cards.** GTX 10-series, GTX 900-series, Titan X, Xp and V, and Quadro P and M cards are no longer supported by current PyTorch. They run on PyTorch 2.14 built for CUDA 12.6, the last version that supports them, and they need NVIDIA's 580 driver series, the last driver that supports them. Choose "NVIDIA, older cards" in the installer (`sh install.sh --nvidia-older`). They will keep working, but will not get newer PyTorch.
+- **Old and new together.** If any card in the machine is that old, choose the older-cards build. It also runs RTX 20-, 30- and 40-series cards beside the old one, so one install covers them all. It cannot run RTX 50-series cards: a machine holding both a GTX 10-series and an RTX 50-series card can use only one of the two.
+- NVIDIA and AMD cards cannot share one install. Choose the maker of the cards you want used.
+- `rosetta_jane cards` tries a small calculation on every card and says which are ready, and what to do about any that are not. The installer runs it at the end.
+- Having the libraries is not the same as using the cards. Add `--device-map auto` to any command that loads a model (`serve`, `gateway`, `ask`, `train`, `score`, `try`) to place the model on the machine's graphics cards, spread across all of them. Without it the model runs on the processor.
+- To cap how much of each card is used, add `--max-memory`, numbering the cards from 0: `--max-memory 0=14GiB,1=6GiB`. To keep an NVIDIA card out altogether, hide it when starting the program: `CUDA_VISIBLE_DEVICES=0 rosetta_jane ...` uses only the first card.
+- None of this has been run on a real graphics card yet. The automated tests pass on PyTorch 2.14 and 2.15, on the processor.
 
 Before loading a model, read "Check the terms of the model you load" below.
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rosetta-jane"
-version = "0.1.0"
+version = "0.1.1"
 description = "Rosetta-Jane: community AI. One model across many volunteer devices, peer to peer, no central server."
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -19,7 +19,7 @@ test = ["pytest", "tokenizers"]
 rosetta_jane = "rosetta_jane.cli:main"
 
 [tool.setuptools]
-packages = ["rosetta_jane", "rosetta_jane.lan"]
+packages = ["rosetta_jane", "rosetta_jane.lan", "rosetta_jane.mobile"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

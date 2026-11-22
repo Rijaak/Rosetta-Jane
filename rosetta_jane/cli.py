@@ -450,6 +450,13 @@ def cmd_scores(args) -> int:
     return 0
 
 
+def cmd_cards(args) -> int:
+    """Say which graphics cards this install can use. Each card is tried with a small calculation."""
+    from .cards import report
+    print("\n".join(report()))
+    return 0
+
+
 def cmd_try(args) -> int:
     """Ask one question and see both answers: the unchanged model, and the model with the adapter."""
     from .swarm import NoRoute
@@ -579,6 +586,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--work-dir", default="rosetta-jane-data")
     s.add_argument("--out", default=None, help="where to save it (default: 'Model Adapter Score.html')")
     s.set_defaults(fn=cmd_scores)
+
+    s = sub.add_parser("cards", help="list this machine's graphics cards and say which ones this install can use")
+    s.set_defaults(fn=cmd_cards)
 
     s = sub.add_parser("try", help="ask one question and see both answers: without an adapter and with it")
     ask_side(s)
