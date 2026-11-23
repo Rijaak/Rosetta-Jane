@@ -28,13 +28,28 @@ def ask_ids(args) -> int:
         scores = []
         real = ends.logits
         ends.logits = lambda h: scores.append(real(h)) or scores[-1]
-        gen = Generation(node, ends, find_wait=10.0,
+        link = None
+        if args.team:                              # sign on to a team and answer with its adapter
+            from ..team import TeamLink
+            link = TeamLink(node, model=ends.fingerprint, code=args.team, want=[[0, args.own_layers]],
+                            find_wait=20.0).join()
+            ends.fit_team(link.use())
+            deadline = time.time() + 60
+            while not link.active() and link.ended is None and time.time() < deadline:
+                time.sleep(0.2)
+            if not link.active():
+                print("RESULT " + json.dumps({"refused": link.ended or "the leader did not begin"}), flush=True)
+                return 0
+        gen = Generation(node, ends, find_wait=10.0, team=link.use() if link else None,
                          redundancy=None if args.redundancy == "auto" else int(args.redundancy))
         out = gen.run([int(v) for v in args.ids.split(",")], args.new)
+        if link is not None:
+            link.leave()
         print("RESULT " + json.dumps({
             "ids": out, "scores": [[float(v) for v in s] for s in scores], "checked": gen.verified_steps,
             "unchecked": gen.unverified_steps, "disputes": gen.disputes, "blocked": sorted(gen.caught),
-            "reroutes": gen.reroutes, "peers": sum(len(h.replicas()) for h in gen.route)}), flush=True)
+            "reroutes": gen.reroutes, "peers": sum(len(h.replicas()) for h in gen.route),
+            "team": link.id if link else None}), flush=True)
     finally:
         node.stop()
     return 0
@@ -136,7 +151,12 @@ def main(argv=None) -> int:
     s.add_argument("--training", action="store_true", help="also help other people train")
     s.add_argument("--max-sessions", type=int, default=2)
     s.add_argument("--work-dir", default="rosetta-jane-data")
+    s.add_argument("--team", action="append", default=[], metavar="CODE",
+                   help="sign this device on to the team with this code; repeat for more")
+    s.add_argument("--team-open", action="store_true",
+                   help="sign this device on to any open team for its model (off unless you say so)")
     q = sub.add_parser("ask-ids", help="answer a prompt given as token numbers (for testing)")
+    q.add_argument("--team", default=None, metavar="CODE", help="sign on to this team and answer with its adapter")
     q.add_argument("--model", required=True)
     q.add_argument("--own-layers", type=int, default=2)
     q.add_argument("--ids", required=True, help="comma-separated token numbers")
@@ -205,22 +225,39 @@ def main(argv=None) -> int:
             start, end = choose(node.table.peers(), model_id, total, args.span)
         else:
             start, end = (int(v) for v in args.layers.split(":"))
-        server = NumpyLayerServer(args.model, start, end, training=args.training, max_sessions=args.max_sessions)
+        server = NumpyLayerServer(args.model, start, end, training=args.training, max_sessions=args.max_sessions,
+                                  work_dir=args.work_dir)
     except (Unsupported, ValueError) as e:
         node.stop()
         raise SystemExit(str(e))
     server.attach(node)
+    from ..helpers import Sharing
+    from ..team import TeamService
+    sharing = Sharing(node, server.helped).attach()
+    teams = TeamService(node, server, codes=args.team, any_open=args.team_open,
+                        say=lambda text: print(text, flush=True))
     print(f"Rosetta-Jane (no PyTorch): p2p service for layers {start}-{end - 1} of model {server.fingerprint} "
           f"on port {node.port}." + (" Also helping with training." if args.training else "") + " Ctrl-C to stop.",
           flush=True)
     try:
+        ticks, told = 0, set()
         while True:
-            time.sleep(60)
-            print(f"  peers known: {len(node.table.peers())}   answer steps helped: {server.steps_served}   "
-                  f"training examples helped: {server.examples_trained}", flush=True)
+            time.sleep(2 if (args.team or args.team_open) else 10)
+            ticks += 1
+            teams.tick()
+            for offer in sharing.offers():
+                if offer["run"] not in told:
+                    told.add(offer["run"])
+                    print(f"  An adapter this device helped train is being shared with its helpers (run "
+                          f"{offer['run']}).", flush=True)
+            if ticks % (30 if (args.team or args.team_open) else 6) == 0:
+                print(f"  peers known: {len(node.table.peers())}   answer steps helped: {server.steps_served}   "
+                      f"training examples helped: {server.examples_trained}", flush=True)
     except KeyboardInterrupt:
         print("stopping")
     finally:
+        teams.leave_all()
+        server.helped.save()
         node.stop()
     return 0
 

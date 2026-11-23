@@ -78,6 +78,7 @@ class TrainJob:
         from .scoring import split_holdout
         self.examples, self.held = split_holdout(self.examples)      # kept back: scored on, never trained on
         self.score: Optional[dict] = None
+        self.flattery: Optional[dict] = None
         steps = req.get("steps") or max(1, round(len(self.examples) * epochs / self.accum))
         self.total_steps = _number({"steps": steps}, "steps", steps, 1, 1_000_000, int)
         self.settings = dict(
@@ -86,6 +87,14 @@ class TrainJob:
             warmup_steps=min(20, max(1, self.total_steps // 10)),
             save_every=_number(req, "save_every", 25, 1, 100000, int))
         self.gateway, self.model_dir, self.work_dir = gateway, model_dir, work_dir
+        self.in_team = req.get("team") is True     # train inside the team this device is in
+        self.start_from = req.get("from")          # carry on from an adapter held here, instead of from nothing
+        if self.start_from is not None:
+            if not isinstance(self.start_from, str) or not _NAME.match(self.start_from) \
+                    or self.start_from not in past_runs(work_dir):
+                raise ValueError("'from' must name an adapter held on this device")
+            if self.start_from == self.name:
+                raise ValueError("give the continued adapter a new name, so the one it starts from is kept")
         self.out = os.path.join(work_dir, "adapters", self.name)
         self.state, self.error = "starting", None
         self.step, self.loss = 0, None
@@ -115,11 +124,24 @@ class TrainJob:
         from .train import SwarmTrainer
         g = self.gateway
         try:
-            self.trainer = SwarmTrainer(
-                g.node, g.ends, self.model_dir, self.work_dir, total_steps=self.total_steps, accum=self.accum,
-                run_id=self.name, redundancy=g.redundancy, tolerance=g.tolerance, auditor=g.auditor,
-                audit_rate=g.audit_rate, canaries=g.canaries, canary_rate=g.canary_rate, variant=g.variant,
-                find_wait=g.find_wait, lock=g._busy, quiet=True, **self.settings)
+            if self.in_team:                       # only the team's signed-on devices do the work
+                t = g.desk.team
+                if t is None or t.ended is not None:
+                    raise ValueError("this device is not in a team; start or join one, or train without 'team'")
+                if t.kind != "teaching":
+                    raise ValueError("training together happens in a teaching team; this one is for sessions")
+                self.settings["team"] = t.id
+            common = dict(total_steps=self.total_steps, accum=self.accum, run_id=self.name,
+                          redundancy=g.redundancy, tolerance=g.tolerance, auditor=g.auditor,
+                          audit_rate=g.audit_rate, canaries=g.canaries, canary_rate=g.canary_rate,
+                          variant=g.variant, find_wait=g.find_wait, lock=g._busy, quiet=True, **self.settings)
+            if self.start_from is None:
+                self.trainer = SwarmTrainer(g.node, g.ends, self.model_dir, self.work_dir, **common)
+            else:                                  # the adapter's own rank and alpha are kept
+                self.trainer = SwarmTrainer.continuing(
+                    g.node, g.ends, self.model_dir, self.work_dir,
+                    os.path.join(self.work_dir, "adapters", self.start_from), **common)
+                self.settings.update(rank=self.trainer.rank, alpha=self.trainer.alpha)
             self.trainer.resume()
             self.step = self.trainer.step
             self.state = "running"
@@ -129,6 +151,9 @@ class TrainJob:
                 self.state = "scoring"
                 with g._busy:
                     self.score = self.trainer.compare(self.held, name=self.name, held_out=True)
+            self.state = "scoring"                 # and does it go along with false statements more than before?
+            with g._busy:
+                self.flattery = self.trainer.flattery(flattery_examples(g.tokenizer, g.max_prompt_tokens))
             self.trainer.export(self.out, os.path.abspath(self.model_dir))
             self.state = "done"
             with open(os.path.join(self.out, FACTS), "w") as f:      # what a person needs to judge this adapter
@@ -139,7 +164,9 @@ class TrainJob:
                            "work_unchecked": self.stats.get("unchecked_examples"),
                            "base_model_name": os.path.basename(os.path.normpath(self.model_dir)),
                            "peers_blocked": self.stats.get("peers_blocked"), "pairs_kept_back": len(self.held),
-                           "score": self.score, **self.settings}, f, indent=2)
+                           "score": self.score, "flattery": self.flattery,
+                           **{k: v for k, v in self.settings.items() if k != "team"},
+                           "trained_in_team": self.in_team, **self.trainer.record()}, f, indent=2)
         except _Stopped:
             self.state = "stopped"
         except NoRoute as e:
@@ -160,8 +187,10 @@ class TrainJob:
                 "checked": t.verified_examples if t else 0, "unchecked": t.unverified_examples if t else 0,
                 "peers_blocked": len(t.caught) if t else 0, "redone": t.redos if t else 0,
                 "seconds": round((self.finished or time.time()) - self.started, 1),
-                "pairs_kept_back": len(self.held), "score": self.score,
-                "adapter": self.out if self.state == "done" else None}
+                "pairs_kept_back": len(self.held), "score": self.score, "flattery": self.flattery,
+                "adapter": self.out if self.state == "done" else None,
+                # When it is done, offering it to the devices that helped is the leader's choice to make.
+                "helpers": len(t.book.helpers) if t is not None and t.book is not None else 0}
 
 
 def adapter_zip(work_dir: str, name: str) -> bytes:
@@ -288,6 +317,67 @@ def import_adapter(work_dir: str, name: str, blob: bytes) -> str:
     return name
 
 
+def keep_received(work_dir: str, name: str, config: dict, weights: bytes, facts: dict) -> str:
+    """Store an adapter that arrived from another device over the network. Returns the name it was given.
+
+    The same rules as a shared zip: the settings are rewritten from checked values, the weights are a
+    safetensors file (numbers only), and storing it applies nothing. A free name is chosen from the
+    one asked for.
+    """
+    rank, alpha, targets = config["r"], config["lora_alpha"], config["target_modules"]
+    if len(weights) > MAX_ADAPTER_BYTES:
+        raise ValueError("that adapter is too large")
+    base = re.sub(r"[^a-z0-9-]+", "-", str(name).lower()).strip("-")[:36] or "shared"
+    folder = os.path.join(work_dir, "adapters")
+    name, n = base, 1
+    while os.path.exists(os.path.join(folder, name)):
+        n += 1
+        name = f"{base}-{n}"
+    target = os.path.join(folder, name)
+    tmp = target + ".partial"
+    os.makedirs(tmp)
+    try:
+        with open(os.path.join(tmp, "adapter_config.json"), "w") as f:
+            json.dump({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": rank, "lora_alpha": alpha,
+                       "lora_dropout": 0.0, "bias": "none", "target_modules": targets,
+                       "fan_in_fan_out": False, "inference_mode": True}, f, indent=2)
+        with open(os.path.join(tmp, "adapter_model.safetensors"), "wb") as f:
+            f.write(weights)
+        with open(os.path.join(tmp, FACTS), "w") as f:
+            json.dump({**facts, "name": name}, f, indent=2)
+        os.replace(tmp, target)
+    except BaseException:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return name
+
+
+def flattery_examples(tokenizer, max_tokens: int = 1024) -> list:
+    """The flattery check's questions and replies, made ready for this model (see flattery.py)."""
+    from .flattery import examples
+    from .lan.data import tokenize_pairs
+
+    def make(question: str, reply: str):
+        made, cut = tokenize_pairs([{"question": question, "answer": reply}], tokenizer, max_tokens)
+        return made[0] if made and not cut else None
+    return examples(make)
+
+
+def save_fact(folder: str, key: str, value) -> None:
+    """Add one thing to the record kept beside an adapter."""
+    path = os.path.join(folder, FACTS)
+    try:
+        with open(path) as f:
+            facts = json.load(f)
+        facts = facts if isinstance(facts, dict) else {}
+    except (OSError, ValueError):
+        facts = {"name": os.path.basename(os.path.normpath(folder))}
+    facts[key] = value
+    with open(path, "w") as f:
+        json.dump(facts, f, indent=2)
+
+
 def adapters_info(work_dir: str) -> List[dict]:
     """Every adapter held here: trained on this device, or received from someone else."""
     out = []
@@ -299,7 +389,13 @@ def adapters_info(work_dir: str) -> List[dict]:
         except (OSError, ValueError):
             pass
         out.append({"name": name, "received": bool(facts.get("received")), "scored": bool(facts.get("score")),
-                    "my_score": bool(facts.get("my_score"))})
+                    "my_score": bool(facts.get("my_score")),
+                    "helpers": facts.get("helpers") if isinstance(facts.get("helpers"), int) else 0,
+                    "continued": bool(facts.get("history")),
+                    "community": (facts.get("community") or {}).get("average")
+                    if isinstance(facts.get("community"), dict) else None,
+                    "flattery": (facts.get("flattery") or {}).get("verdict")
+                    if isinstance(facts.get("flattery"), dict) else None})
     return out
 
 

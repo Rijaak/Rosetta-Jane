@@ -41,7 +41,10 @@ BEACON_PORT = 47700
 _BEACON_MAGIC = b"RSTA1"
 _ADDR_RE = re.compile(r"^[0-9A-Za-z.\-]{1,64}:\d{1,5}$")
 _HEX_RE = re.compile(r"^[0-9a-f]{8,64}$")
+_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 MAX_SERVICES = 8
+MAX_TEAMS = 8                  # teams one serving device may be signed on to
+MAX_NOTICES = 32               # team and sharing announcements one node may make
 MAX_PEERS = 2000
 MAX_CANDIDATES = 500
 MAX_EXCHANGE = 200
@@ -57,6 +60,30 @@ def swarm_secret(group_code: Optional[str] = None, secret_file: Optional[str] = 
 
 def _log(msg: str) -> None:
     print(f"[jane {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def clean_ids(raw, limit: int = MAX_TEAMS) -> List[str]:
+    """Validate a list of announced ids (teams, shared training runs) received from another peer."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > limit \
+            or not all(isinstance(v, str) and _ID_RE.match(v) for v in raw):
+        raise ValueError("bad id list")
+    return list(dict.fromkeys(raw))
+
+
+def clean_name(raw) -> str:
+    """A name someone chose for team screens: short, printable, one line. A label; nothing checks whose it is."""
+    if not isinstance(raw, str):
+        return ""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in raw).split())[:24]
+
+
+def clean_presence(raw) -> dict:
+    """Whether a peer's owner can be invited to teams. Anything but a plain yes counts as no."""
+    raw = raw if isinstance(raw, dict) else {}
+    return {"invites": raw.get("invites") is True, "busy": raw.get("busy") is True,
+            "name": clean_name(raw.get("name"))}
 
 
 def clean_services(raw) -> List[dict]:
@@ -81,7 +108,8 @@ def clean_services(raw) -> List[dict]:
         if not (isinstance(hidden, int) and 0 < hidden <= 1 << 20 and isinstance(free, int) and 0 <= free <= 4096):
             raise ValueError("bad service numbers")
         out.append({"model": model, "variant": variant, "layers": [layers[0], layers[1]],
-                    "hidden": hidden, "free": free, "train": bool(s.get("train", False))})
+                    "hidden": hidden, "free": free, "train": bool(s.get("train", False)),
+                    "teams": clean_ids(s.get("teams"))})
     return out
 
 
@@ -92,6 +120,11 @@ class Peer:
     services: List[dict] = field(default_factory=list)
     seen: float = 0.0          # local clock, last time we connected to it ourselves
     failures: int = 0
+    leads: List[str] = field(default_factory=list)   # teams this node says it leads
+    gifts: List[str] = field(default_factory=list)   # training runs whose result it is sharing with helpers
+    invites: bool = False      # its owner sees invitations to teams, and has not chosen to be invisible
+    busy: bool = False         # it is in a team right now
+    name: str = ""             # what its owner chose to be called on team screens; a label, never checked
 
 
 class PeerTable:
@@ -104,14 +137,17 @@ class PeerTable:
         self._candidates: Dict[str, float] = {}  # addr -> time first heard
         self._self_addrs: set = set()
 
-    def confirm(self, node_id: str, addr: str, services: List[dict]) -> None:
+    def confirm(self, node_id: str, addr: str, services: List[dict], leads: Optional[List[str]] = None,
+                gifts: Optional[List[str]] = None, invites: bool = False, busy: bool = False,
+                name: str = "") -> None:
         with self._lock:
             self._candidates.pop(addr, None)
             for other_id, p in list(self._peers.items()):   # an address now belongs to a new node
                 if p.addr == addr and other_id != node_id:
                     del self._peers[other_id]
             if len(self._peers) < MAX_PEERS or node_id in self._peers:
-                self._peers[node_id] = Peer(node_id, addr, services, time.time(), 0)
+                self._peers[node_id] = Peer(node_id, addr, services, time.time(), 0, list(leads or []),
+                                            list(gifts or []), invites, busy, name)
 
     def suggest(self, addr: str) -> None:
         if not isinstance(addr, str) or not _ADDR_RE.match(addr):
@@ -151,8 +187,8 @@ class PeerTable:
 
     def peers(self) -> List[Peer]:
         with self._lock:
-            return [Peer(p.node_id, p.addr, [dict(s) for s in p.services], p.seen, p.failures)
-                    for p in self._peers.values()]
+            return [Peer(p.node_id, p.addr, [dict(s) for s in p.services], p.seen, p.failures, list(p.leads),
+                         list(p.gifts), p.invites, p.busy, p.name) for p in self._peers.values()]
 
     def candidates(self) -> List[str]:
         with self._lock:
@@ -183,6 +219,8 @@ class Node:
         self.handlers: Dict[str, Handler] = {}
         self.disconnect_hooks: List[Callable[[dict], None]] = []
         self.services_fn: Callable[[], List[dict]] = lambda: []
+        self.notices: Dict[str, Callable[[], List[str]]] = {}   # "leads" and "gifts": ids announced to the group
+        self.presence: Optional[Callable[[], dict]] = None       # {"invites": bool, "busy": bool}, for invite lists
         self.gossip_interval = gossip_interval
         self.quiet = quiet
         self._bootstrap = list(bootstrap or [])
@@ -239,8 +277,17 @@ class Node:
                 pass
 
     def info(self) -> dict:
-        return {"node_id": self.node_id, "port": self.port, "version": __version__,
-                "services": self.services_fn()}
+        out = {"node_id": self.node_id, "port": self.port, "version": __version__,
+               "services": self.services_fn()}
+        for kind in ("leads", "gifts"):
+            said = self.notices[kind]()[:MAX_NOTICES] if kind in self.notices else []
+            if said:
+                out[kind] = said
+        if self.presence is not None:
+            here = self.presence()
+            out["presence"] = {"invites": bool(here.get("invites")), "busy": bool(here.get("busy")),
+                               "name": clean_name(here.get("name"))}
+        return out
 
     # -- serving -------------------------------------------------------------
     def _accept_loop(self) -> None:
@@ -333,7 +380,9 @@ class Node:
             if node_id == self.node_id:
                 self.table.mark_self(addr)
                 return False
-            self.table.confirm(node_id, addr, clean_services(hello.get("services", [])))
+            self.table.confirm(node_id, addr, clean_services(hello.get("services", [])),
+                               clean_ids(hello.get("leads"), MAX_NOTICES),
+                               clean_ids(hello.get("gifts"), MAX_NOTICES), **clean_presence(hello.get("presence")))
             reply, _, _ = ch.call({"op": "peers"})
             shared = reply.get("peers", [])
             if isinstance(shared, list):

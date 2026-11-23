@@ -38,8 +38,26 @@ class Ends:
         return self._embed_file.rows(self._embed_key, [int(i) for i in ids])
 
     # -- answering ---------------------------------------------------------------------------
-    def head(self, new_ids: List[int], cache):
-        out, cache = self.stack.step(0, self.own_layers, self.embed(new_ids), cache)
+    def fit_team(self, team) -> dict:
+        """Check a team's adapter against this device's own first layers, and get it ready to apply."""
+        from .peer import check_adapters
+
+        def make():
+            shapes = self.stack.shapes(0, self.own_layers, team.targets)
+            try:
+                mine = {f"{name}.{part}": team.adapters[f"{name}.{part}"] for name in shapes for part in ("A", "B")}
+                check_adapters(mine, shapes, team.rank)
+            except (KeyError, ValueError):
+                raise ValueError("the team's adapter does not fit this device's own layers") from None
+            if not mine:
+                raise ValueError(f"these layers have no modules named {team.targets}")
+            return {name: (mine[name + ".A"], mine[name + ".B"], team.scale) for name in shapes}
+        return team.memo(("ends", id(self)), make)
+
+    def head(self, new_ids: List[int], cache, team=None):
+        """This device's own first layers. With a team, the team's adapter is applied to them."""
+        lora = self.fit_team(team) if team is not None and not team.plain else None
+        out, cache = self.stack.step(0, self.own_layers, self.embed(new_ids), cache, lora)
         return out[None], cache
 
     def logits(self, h_last: np.ndarray) -> np.ndarray:

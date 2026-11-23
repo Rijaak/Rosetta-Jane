@@ -28,6 +28,8 @@ Code was written with the assistance of Claude AI.
 
 **Project N.O.M.A.D. and its creators, Crosstalk Solutions LLC and the Project NOMAD contributors** — the inspiration for both the concept and the interface. Rosetta-Jane grew out of work on NOMAD's remote AI server support, it is designed to plug into NOMAD, and its settings page follows NOMAD's layout and wording. NOMAD is licensed under Apache-2.0: https://github.com/Crosstalk-Solutions/project-nomad
 
-Rosetta-Jane is an independent project. It is not affiliated with, endorsed by, or supported by Crosstalk Solutions or the Project NOMAD maintainers, and they did not write or review this code. Problems with Rosetta-Jane should be reported here, not to them.
+**BBSC: Yharnam Together and the team who built it** — the inspiration for how teams work. A leader who starts a team, a short team code, teams anyone can see and ask to join, invitations, staying invisible, and a leader's settings that are remembered for the next team all follow the co-op team screen of Yharnam Together, the community co-op project for Bloodborne's PC port: https://github.com/Amanises-Yharnam-Together/BBSC-Yharnam-Together. Rosetta-Jane contains none of their source code; the debt is to the design.
+
+Rosetta-Jane is an independent project. It is not affiliated with, endorsed by, or supported by Crosstalk Solutions, the Project NOMAD maintainers, or the Yharnam Together team, and none of them wrote or reviewed this code. Problems with Rosetta-Jane should be reported here, not to them.
 
 The name comes from Jane, the character in Orson Scott Card's Ender series.

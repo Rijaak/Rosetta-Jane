@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rosetta-jane"
-version = "0.1.1"
+version = "0.2.0"
 description = "Rosetta-Jane: community AI. One model across many volunteer devices, peer to peer, no central server."
 readme = "README.md"
 license = "AGPL-3.0-only"

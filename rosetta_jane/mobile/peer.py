@@ -51,7 +51,18 @@ def _hidden_states(tensor, hidden: int, limit: int) -> bool:
 
 class NumpyLayerServer:
     def __init__(self, model_dir: str, start: int, end: int, *, max_sessions: int = 2, max_tokens: int = 4096,
-                 session_ttl: float = 600.0, training: bool = False, max_train_tokens: int = 1024):
+                 session_ttl: float = 600.0, training: bool = False, max_train_tokens: int = 1024,
+                 work_dir: Optional[str] = None):
+        import os
+
+        from ..helpers import HelpLog
+        self.helped = HelpLog(os.path.join(work_dir, "helped.json") if work_dir else None)
+        self._node_id = ""
+        self._teams: Dict[str, dict] = {}          # teams this device's owner has signed it on to
+        self._weigh: Dict[str, object] = {}
+        self.team_steps_served = 0
+        from ..fair import FairTurns
+        self._fair = FairTurns()                   # shares this device's time between the people using it
         self.stack = Stack(model_dir, start, end)
         self.start, self.end = start, end
         self.fingerprint, self.hidden, self.variant = self.stack.fingerprint, self.stack.hidden, VARIANT
@@ -66,14 +77,62 @@ class NumpyLayerServer:
         with self._lock:
             self._expire()
             free = max(0, self.max_sessions - len(self._sessions))
+            teams = sorted(self._teams)
         return {"model": self.fingerprint, "variant": self.variant, "layers": [self.start, self.end],
-                "hidden": self.hidden, "free": free, "train": self.training}
+                "hidden": self.hidden, "free": free, "train": self.training, "teams": teams}
 
     def attach(self, node) -> None:
         for op in ("open", "step", "close", "t_open", "t_adapters", "t_fwd", "t_bwd", "t_grads", "t_reset"):
             node.handlers[op] = getattr(self, "_" + op)
         node.disconnect_hooks.append(self._drop)
         node.services_fn = lambda: [] if self.paused else [self.service()]
+        self._node_id = node.node_id
+
+    # -- teams: an adapter applied because this device's owner signed on, and only for that team -------
+    def join_team(self, team_id: str, blob: Optional[bytes], rank=None, alpha=None, targets=None,
+                  weight_of=None) -> None:
+        """Hold a team's adapter for this device's layers. Sessions opened for that team use it; no others do.
+        weight_of(tag, proof) says how large a share of this device a member's work gets (100 is plain)."""
+        from ..net import MAX_TEAMS, _ID_RE
+        if not (isinstance(team_id, str) and _ID_RE.match(team_id)):
+            raise ValueError("bad team id")
+        self._weigh[team_id] = weight_of
+        if blob is None:                           # a team with no adapter: these layers serve it unchanged
+            with self._lock:
+                if team_id not in self._teams and len(self._teams) >= MAX_TEAMS:
+                    raise RuntimeError(f"this device is already signed on to {MAX_TEAMS} teams")
+                self._teams[team_id] = None
+            return
+        rank, alpha, targets = check_spec(rank, alpha, targets)
+        shapes = self.stack.shapes(self.start, self.end, targets)
+        if not shapes:
+            raise ValueError(f"these layers have no modules named {targets}")
+        if not blob or len(blob) > 1 << 30:
+            raise ValueError("adapters missing or too large")
+        try:
+            sent = st.loads(blob)
+            mine = {f"{name}.{part}": sent[f"{name}.{part}"] for name in shapes for part in ("A", "B")}
+        except KeyError:
+            raise ValueError("the team's adapter does not cover this device's layers") from None
+        except st.FormatError as e:
+            raise ValueError(f"the team's adapter could not be read: {e}") from None
+        check_adapters(mine, shapes, rank)
+        scale = alpha / rank
+        lora = {name: (mine[name + ".A"], mine[name + ".B"], scale) for name in shapes}
+        with self._lock:
+            if team_id not in self._teams and len(self._teams) >= MAX_TEAMS:
+                raise RuntimeError(f"this device is already signed on to {MAX_TEAMS} teams")
+            self._teams[team_id] = lora
+
+    def leave_team(self, team_id: str) -> None:
+        """Let a team's adapter go. Its sessions end; everything else carries on untouched."""
+        with self._lock:
+            self._teams.pop(team_id, None)
+            self._sessions[:] = [s for s in self._sessions if s.get("team") != team_id]
+
+    def teams(self) -> List[str]:
+        with self._lock:
+            return sorted(self._teams)
 
     # -- shared bookkeeping -------------------------------------------------------------------
     def _expire(self) -> None:
@@ -121,8 +180,19 @@ class NumpyLayerServer:
     # -- answering ----------------------------------------------------------------------------
     def _open(self, ch: Channel, header: dict, tensor, state: dict) -> None:
         x, y = self._range(header)
-        self._begin(state, "session", {"range": (x, y), "cache": None, "tokens": 0})
-        ch.send({"op": "open_ok", "variant": self.variant})
+        session = {"range": (x, y), "cache": None, "tokens": 0}
+        team = header.get("team")
+        if team is not None:
+            with self._lock:
+                signed = isinstance(team, str) and team in self._teams
+                lora = self._teams.get(team) if signed else None
+            if not signed:
+                raise RuntimeError("this peer has not signed on to that team")
+            session.update(team=team, lora=lora)
+            if isinstance(header.get("as"), str) and len(header["as"]) == 16:
+                session.update({"as": header["as"], "proof": header.get("proof")})
+        self._begin(state, "session", session)
+        ch.send({"op": "open_ok", "variant": self.variant, **({"team": team} if team is not None else {})})
 
     def _step(self, ch: Channel, header: dict, tensor, state: dict) -> None:
         session = self._current(state, "session", "no open session (it may have timed out)")
@@ -130,11 +200,21 @@ class NumpyLayerServer:
             raise ProtocolError("hidden states must have shape [1, tokens, hidden size]")
         if session["tokens"] + tensor.shape[1] > self.max_tokens:
             raise RuntimeError(f"session is limited to {self.max_tokens} tokens")
-        with self._lock:
-            out, session["cache"] = self.stack.step(*session["range"], tensor[0], session["cache"])
+        flow, weight = id(session), 100
+        if "as" in session:                        # a team member's work: all of it shares one place in the queue
+            flow = (session["team"], session["as"])
+            weigh = self._weigh.get(session["team"])
+            if weigh is not None:
+                weight = weigh(session["as"], session.get("proof"))
+        with self._fair.turn(flow, weight, tensor.shape[1]), self._lock:
+            if not any(session is s for s in self._sessions):
+                raise RuntimeError("no open session (its team may have ended)")
+            out, session["cache"] = self.stack.step(*session["range"], tensor[0], session["cache"],
+                                                    session.get("lora"))
             session["tokens"] += tensor.shape[1]
             self.steps_served += 1
             self.tokens_served += tensor.shape[1]
+            self.team_steps_served += "team" in session
         ch.send({"op": "step_ok"}, tensor=out[None])
 
     def _close(self, ch: Channel, header: dict, tensor, state: dict) -> None:
@@ -150,13 +230,17 @@ class NumpyLayerServer:
             raise RuntimeError("this peer is not serving right now")
         if not self.training:
             raise RuntimeError("this peer has not agreed to help with training")
+        if header.get("team") is not None and header.get("team") not in self._teams:
+            raise RuntimeError("this peer has not signed on to that team")
         x, y = self._range(header)
         rank, alpha, targets = check_spec(header.get("rank"), header.get("alpha"), header.get("targets"))
         shapes = self.stack.shapes(x, y, targets)
         if not shapes:
             raise ValueError(f"these layers have no modules named {targets}")
         self._begin(state, "training", {"range": (x, y), "rank": rank, "scale": alpha / rank, "shapes": shapes,
-                                        "adapters": None, "graph": None, "grads": None})
+                                        "adapters": None, "graph": None, "grads": None,
+                                        "run": self.helped.note(header.get("run"), header.get("ticket"),
+                                                                self._node_id)})
         ch.send({"op": "t_open_ok", "variant": self.variant})
 
     def _t_adapters(self, ch: Channel, header: dict, tensor, state: dict) -> None:
@@ -196,6 +280,7 @@ class NumpyLayerServer:
             g_in, grads = self.stack.backward(graph, tensor[0])
             session.update(graph=None, grads=grads)
             self.examples_trained += 1
+        self.helped.count(session.get("run"))
         ch.send({"op": "t_bwd_ok"}, tensor=g_in[None])
 
     def _t_grads(self, ch: Channel, header: dict, tensor, state: dict) -> None:

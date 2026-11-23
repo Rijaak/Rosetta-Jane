@@ -36,10 +36,12 @@ def _ip(addr: str) -> str:
 
 def plan_route(peers: Sequence[Peer], model: str, start: int, end: int,
                exclude: Optional[Set[str]] = None, variant: Optional[str] = None,
-               rng: Optional[random.Random] = None, training: bool = False) -> List[Hop]:
+               rng: Optional[random.Random] = None, training: bool = False,
+               team: Optional[str] = None) -> List[Hop]:
     """Fewest hops covering layers [start, end): at each point take the peer that reaches furthest.
 
     With training=True only peers that have agreed to help with training are used.
+    With a team, only peers that have signed on to that team are used.
     """
     exclude = exclude or set()
     rng = rng or random
@@ -49,14 +51,15 @@ def plan_route(peers: Sequence[Peer], model: str, start: int, end: int,
             continue
         for s in p.services:
             if s["model"] == model and (variant is None or s["variant"] == variant) \
-                    and (not training or s.get("train")):
+                    and (not training or s.get("train")) and (team is None or team in s.get("teams", ())):
                 offers.append((p, s))
     hops: List[Hop] = []
     at = start
     while at < end:
         usable = [(p, s) for p, s in offers if s["layers"][0] <= at < s["layers"][1]]
         if not usable:
-            raise NoRoute(f"no reachable peer serves layer {at} of this model")
+            raise NoRoute(f"no reachable peer serves layer {at} of this model"
+                          + (" for this team (a device serving it has to sign on to the team)" if team else ""))
         peer, service = max(usable, key=lambda ps: (min(ps[1]["layers"][1], end), ps[1]["free"] > 0,
                                                     ps[1]["free"], rng.random()))
         stop = min(service["layers"][1], end)

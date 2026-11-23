@@ -65,7 +65,7 @@ def _run(model_dir, group_code, peers, layers, span, training, work_dir, port):
             first, last = choose(node.table.peers(), model_id, total, span)
         else:
             first, last = (int(v) for v in layers.split(":"))
-        server = NumpyLayerServer(model_dir, first, last, training=training)
+        server = NumpyLayerServer(model_dir, first, last, training=training, work_dir=work_dir)
         server.attach(node)
         with _lock:
             if _state["phase"] != "starting":      # stopped while the model was loading
@@ -84,9 +84,12 @@ def _run(model_dir, group_code, peers, layers, span, training, work_dir, port):
 
 
 def stop():
+    _team_reset("the p2p service was switched off")     # a team does not outlive the connection it was made on
     with _lock:
-        node = _state["node"]
+        node, server = _state["node"], _state["server"]
         _state.update(node=None, server=None, phase="stopped", layers=None)
+    if server is not None:
+        server.helped.save()
     if node is not None:
         node.stop()
     return "stopped"
@@ -200,13 +203,19 @@ def _ask_run(model_dir, group_code, peers, messages_json, max_new, temperature, 
             if not text.endswith("�"):        # half of a character; wait for the rest
                 _ask["text"] = text
             return not _ask["stop"]
-        gen = Generation(node, ends, find_wait=10.0, redundancy=None)
+        desk = _team["desk"]                       # in a team that has begun, answer with its adapter
+        if desk is not None and desk.team is not None and desk.team.ended is None and desk.team.kind == "teaching":
+            raise ValueError("This phone is in a teaching team, which gives its power to training. Leave the "
+                             "teaching team to ask questions.")
+        use = desk.use() if desk is not None and desk.node is node and desk.ends is ends else None
+        gen = Generation(node, ends, find_wait=10.0, redundancy=None, team=use)
         started = time.time()
         gen.run(ids, max_new, temperature=temperature, top_p=0.9, stop_ids=sorted(stops), on_token=on_token)
         _ask["text"] = tok.decode(produced)
         _ask["stats"] = {"tokens": len(produced), "seconds": round(time.time() - started, 1),
                          "peers": sum(len(h.replicas()) for h in gen.route), "checked": gen.verified_steps,
-                         "unchecked": gen.unverified_steps, "blocked": len(gen.caught)}
+                         "unchecked": gen.unverified_steps, "blocked": len(gen.caught),
+                         "team": (desk.team.name if not use.plain else "no adapter") if use is not None else None}
     except BaseException as e:
         _ask["error"] = _explain(e)
     finally:
@@ -245,7 +254,8 @@ def _read_pairs(path):
     return pairs, skipped
 
 
-def train_start(model_dir, group_code, peers, pairs_path, name, epochs, own_layers, files_dir):
+def train_start(model_dir, group_code, peers, pairs_path, name, epochs, own_layers, files_dir, start_from=""):
+    """start_from names an adapter held here to carry on from, instead of starting from nothing."""
     if _train["state"] in ("starting", "running", "stopping", "scoring"):
         return "busy"
     if not _ask["done"]:
@@ -253,7 +263,7 @@ def train_start(model_dir, group_code, peers, pairs_path, name, epochs, own_laye
     _train.update(state="starting", error=None, step=0, total=0, loss=None, pairs=0, skipped=0, checked=0,
                   unchecked=0, blocked=0, name=name, stop=False, trainer=None, score_lines=[])
     threading.Thread(target=_train_run, args=(model_dir, group_code, list(peers), pairs_path, name, float(epochs),
-                                              int(own_layers), files_dir), daemon=True).start()
+                                              int(own_layers), files_dir, str(start_from or "")), daemon=True).start()
     return "started"
 
 
@@ -261,12 +271,16 @@ class _Stopped(Exception):
     pass
 
 
-def _train_run(model_dir, group_code, peers, pairs_path, name, epochs, own_layers, files_dir):
+def _train_run(model_dir, group_code, peers, pairs_path, name, epochs, own_layers, files_dir, start_from=""):
     try:
-        from rosetta_jane.control import _NAME
+        from rosetta_jane.control import _NAME, past_runs
         from rosetta_jane.mobile.train import Trainer
         if not _NAME.match(name):
             raise ValueError("The run name may use lowercase letters, digits and dashes, up to 40 characters.")
+        if start_from and (not _NAME.match(start_from) or start_from not in past_runs(os.path.join(files_dir, "work"))):
+            raise ValueError("The adapter to continue from is not on this device.")
+        if start_from == name:
+            raise ValueError("Give the continued adapter a new name, so the one it starts from is kept.")
         node, ends, tok = _session(model_dir, group_code, peers, own_layers)
         pairs, skipped = _read_pairs(pairs_path)
         examples = []
@@ -282,8 +296,18 @@ def _train_run(model_dir, group_code, peers, pairs_path, name, epochs, own_layer
         examples, held = split_holdout(examples)   # kept back: scored on, never trained on
         accum = min(16, len(examples))
         total = max(1, round(len(examples) * epochs / accum))
-        trainer = Trainer(node, ends, os.path.join(files_dir, "work"), total_steps=total, accum=accum,
-                          warmup_steps=min(20, max(1, total // 10)), run_id=name, find_wait=10.0, save_every=5)
+        settings = dict(total_steps=total, accum=accum, warmup_steps=min(20, max(1, total // 10)), run_id=name,
+                        find_wait=10.0, save_every=5)
+        desk = _team["desk"]                       # in a teaching team, only its devices do the work
+        teaching = desk is not None and desk.node is node and desk.team is not None \
+            and desk.team.ended is None and desk.team.kind == "teaching"
+        if teaching:
+            settings["team"] = desk.team.id
+        if start_from:
+            trainer = Trainer.continuing(node, ends, os.path.join(files_dir, "work"),
+                                         os.path.join(files_dir, "work", "adapters", start_from), **settings)
+        else:
+            trainer = Trainer(node, ends, os.path.join(files_dir, "work"), **settings)
         _train.update(state="running", total=total, pairs=len(examples), skipped=skipped, trainer=trainer)
 
         def on_step(step):
@@ -299,8 +323,13 @@ def _train_run(model_dir, group_code, peers, pairs_path, name, epochs, own_layer
             score = trainer.compare(held, name=name, held_out=True)
             from rosetta_jane.scoring import describe
             _train["score_lines"] = describe(score)
-        trainer.export(os.path.join(files_dir, "work", "adapters", name), len(examples), os.path.basename(model_dir),
-                       score, len(held))
+        from rosetta_jane import flattery
+        from rosetta_jane.control import save_fact
+        checked = trainer.flattery(flattery.examples(lambda q, a: tok.pair_example(q, a, 512)))
+        _train["score_lines"] = list(_train["score_lines"]) + flattery.describe(checked)
+        out_dir = trainer.export(os.path.join(files_dir, "work", "adapters", name), len(examples),
+                                 os.path.basename(model_dir), score, len(held))
+        save_fact(out_dir, "flattery", checked)
         _train.update(state="done", step=stats["steps"], loss=stats["final_loss"], checked=stats["checked"],
                       unchecked=stats["unchecked"], blocked=stats["peers_blocked"])
     except _Stopped:
@@ -440,6 +469,26 @@ def adapter_score(model_dir, group_code, peers, own_layers, files_dir, name, pai
     return "started"
 
 
+def adapter_flattery(model_dir, group_code, peers, own_layers, files_dir, name):
+    """Measure whether an adapter goes along with false statements more than the unchanged model does."""
+    from rosetta_jane import flattery
+    from rosetta_jane.control import AdapterJob, save_fact
+    if _busy():
+        return "busy"
+    peers = list(peers)
+
+    def work(job):
+        trainer, ends, tok = _holding(model_dir, group_code, peers, own_layers, files_dir, name)
+        examples = flattery.examples(lambda q, a: tok.pair_example(q, a, 512))
+        job.total = len(examples)
+        result = trainer.flattery(examples)
+        job.done_count = len(examples)
+        save_fact(os.path.join(files_dir, "work", "adapters", name), "flattery", result)
+        return {"flattery": result, "lines": flattery.describe(result)}
+    _side["job"] = AdapterJob("flattery", name, work, 0)
+    return "started"
+
+
 def adapter_poll():
     job = _side["job"]
     return json.dumps(job.report() if job is not None else None)
@@ -449,3 +498,344 @@ def adapter_stop():
     if _side["job"] is not None:
         _side["job"].stop()
     return "stopping"
+
+
+# -- teams, and sharing with the devices that helped ------------------------------------------------
+# The screen is drawn from what team_poll() returns: some lines of text and a list of buttons. Each
+# button names something for panel_do() to do. All the deciding happens here, where it can be tested.
+_team = {"desk": None, "sharing": None}
+_panel = {"message": "", "looked": None, "found": None, "devices": None, "offer": None}
+
+
+def _team_reset(reason=""):
+    desk = _team["desk"]
+    if desk is not None and desk.team is not None and desk.team.ended is None:
+        desk.leave()
+        if desk.team.role == "leader":
+            desk.team.settle(6.0)
+        _panel["message"] = f"Your team is over: {reason}." if reason else _panel["message"]
+    _team.update(desk=None, sharing=None)
+    _panel.update(looked=None, found=None, devices=None, offer=None)
+
+
+def _desk(model_dir, group_code, peers, own_layers, files_dir):
+    """The team desk for the current connection. A new connection (p2p switched on or off) starts fresh."""
+    from rosetta_jane.helpers import HelpLog, Sharing
+    from rosetta_jane.mobile.train import all_shapes
+    from rosetta_jane.team import TeamDesk
+    node, ends, _ = _session(model_dir, group_code, peers, own_layers)
+    with _lock:
+        server = _state["server"] if _state["node"] is node else None
+    desk = _team["desk"]
+    if desk is None or desk.node is not node or desk.ends is not ends or desk.service is not server:
+        _team_reset("the connection changed")
+        desk = TeamDesk(node, ends, layer_prefix=ends.stack.prefix, service=server, find_wait=10.0,
+                        shapes=lambda targets: all_shapes(model_dir, ends.stack.prefix, targets),
+                        work_dir=os.path.join(files_dir, "work"), model_name=os.path.basename(model_dir),
+                        helped=server.helped if server is not None else
+                        HelpLog(os.path.join(files_dir, "work", "helped.json")))
+        _team.update(desk=desk, sharing=Sharing(node, server.helped if server is not None else None).attach())
+    return desk, server
+
+
+def panel_do(model_dir, group_code, peers, own_layers, files_dir, kind, what, req_json):
+    """One button press on the Teams part of the screen. Returns "" or a message; team_poll() shows the rest."""
+    from rosetta_jane.team import NoTeam, fact_lines, open_teams
+    try:
+        req = json.loads(req_json or "{}")
+        called = req.pop("_called", None)          # the name box on the screen travels with every press
+        typed = req.pop("_question", "")           # and so does whatever is in the Ask box
+        if what == "forget":
+            _panel.update(looked=None, found=None, devices=None, offer=None, message="")
+            return ""
+        if _busy() and what in ("create", "join", "leave", "begin", "remove"):
+            raise ValueError("Wait for the question, training or trial in progress to finish first.")
+        desk, server = _desk(model_dir, group_code, list(peers), own_layers, files_dir)
+        sharing = _team["sharing"]
+        if isinstance(called, str) and called.strip() != desk.name:
+            desk.control("settings", {"name": called})
+        reachable = server is not None             # others can only connect to this phone while its p2p service is on
+        _panel["message"] = ""
+        if kind == "share":
+            run = str(req.get("run", ""))
+            if what == "open":
+                if not reachable:
+                    raise ValueError("Switch the p2p service on first: the devices that helped have to be able "
+                                     "to reach this phone to take a copy.")
+                row = sharing.open(os.path.join(files_dir, "work", "adapters", str(req.get("name"))),
+                                   desk.ends.fingerprint)
+                _panel["message"] = (f"Offering \"{row['name']}\" to the {row['helpers']} device(s) that helped "
+                                     "train it, for as long as the p2p service stays on. Each owner decides.")
+            elif what == "close":
+                sharing.close(run)
+            elif what == "look":
+                found = sharing.look(run)
+                _panel["offer"] = {"run": run, "lines": [f"Adapter \"{found['name']}\", offered to this device "
+                                                         "because it helped train it."] + fact_lines(found)[1:]}
+            elif what == "take":
+                kept = sharing.take(run, os.path.join(files_dir, "work"), desk.ends.fingerprint)
+                _panel.update(offer=None, message=f"Stored as \"{kept}\" with your adapters. Nothing has been "
+                                                   "applied. You can try it, score it, lead a team with it or "
+                                                   "train it further.")
+            return ""
+        if what == "blind":                        # two unlabelled answers; the person says which was right
+            if _busy() or _blind["state"] == "running":
+                raise ValueError("Wait for the question, training or trial in progress to finish first.")
+            use = desk.use()
+            if use is None or use.plain:
+                raise ValueError("Blind comparisons are for a team that has begun and uses an adapter.")
+            own = bool(req.get("own"))
+            if own and not str(typed).strip():
+                raise ValueError("Type your question in the Ask box above first.")
+            from rosetta_jane.flattery import trick_question
+            question = str(typed).strip() if own else trick_question()
+            _blind.update(state="running", question=question, a="", b="", id="", error=None)
+            threading.Thread(target=_blind_run, args=(desk, question, not own), daemon=True).start()
+            return ""
+        if what == "pick":
+            shown = desk.control("pick", req)["revealed"]
+            _blind.update(state="idle")
+            _panel["message"] = (f"Answer {shown['adapter_was'].upper()} was the adapter's. Your answer joins its "
+                                 "community rating.")
+            return ""
+        if what == "skip":
+            _panel.setdefault("skipped", set()).add(req.get("question"))
+            return ""
+        if what in ("create", "invite", "devices") and not reachable:
+            raise ValueError("Switch the p2p service on first: a leader's device has to be reachable by its team.")
+        if what == "quick":                        # find an open team and show it; signing on is the next press
+            desk.node.refresh(1)
+            found = open_teams(desk.node, desk.ends.fingerprint)
+            if not found:
+                raise ValueError("No open team for this model in your group right now. Lead one with an adapter "
+                                 "of yours, or ask a leader for their code.")
+            what, req = "look", {"team": found[0]["team"]}
+        if what == "look":
+            got = desk.control("look", req)["look"]
+            invited = True
+            try:
+                desk.invitations.get(got["team"])
+            except NoTeam:
+                invited = False
+            _panel["looked"] = {"req": req, "lines": got["lines"], "name": got["name"], "fits": got["fits"],
+                                "asks": got["joining"] == "ask" and "code" not in req and not invited}
+        elif what == "list":
+            got = desk.control("list", req)
+            _panel["found"] = got
+            if not got["teams"] and not got["teaching"] and not got["invitations"]:
+                _panel["message"] = ("No teams are listed in your group right now. Invisible teams take their "
+                                     "code or an invitation.")
+        elif what == "devices":
+            _panel["devices"] = desk.control("devices", req)["devices"]
+        else:
+            desk.control(what, req)
+            if what == "join":
+                _panel.update(looked=None, found=None)
+                if desk.pending is not None:
+                    _panel["message"] = ("Asked. If the leader approves, this phone is signed on and supplied "
+                                         "with the adapter at once.")
+            if what == "invite":
+                _panel["devices"] = desk.control("devices", {})["devices"]
+            if what == "leave":
+                _panel.update(devices=None)
+            if what == "rate":
+                _panel["message"] = "Thank you. Your mark joins the adapter's community rating."
+            if what == "join":
+                _panel["skipped"] = set()
+        return ""
+    except (ValueError, NoTeam, PermissionError) as e:
+        _panel["message"] = str(e)
+    except KeyError as e:
+        _panel["message"] = str(e.args[0]) if e.args else "That is no longer there."
+    except Exception as e:                         # shown on the screen; never crashes the app
+        _panel["message"] = _explain(e)
+    return _panel["message"]
+
+
+_blind = {"state": "idle", "question": "", "a": "", "b": "", "id": "", "error": None}
+
+
+def _blind_run(desk, question, trick):
+    """Answer one question twice, with the team's adapter and with the unchanged model, for a blind comparison."""
+    try:
+        from rosetta_jane.swarm import Generation
+        node, ends, tok = desk.node, desk.ends, _own["tok"]
+        ids = tok.chat_ids([{"role": "user", "content": question}], True)
+        stops = {t for t in (tok.eos_token_id, ends.eos_token_id) if isinstance(t, int)}
+        texts = []
+        for use in (desk.use(), None):
+            gen = Generation(node, ends, find_wait=10.0, redundancy=None, team=use)
+            texts.append(tok.decode(gen.run(ids, 96, temperature=0.0, stop_ids=sorted(stops))))
+        shown = desk.blind_put(texts[0], texts[1], trick)
+        _blind.update(state="ready", a=shown["a"], b=shown["b"], id=shown["id"])
+    except BaseException as e:
+        _blind.update(state="idle", error=_explain(e))
+        _panel["message"] = "The blind comparison could not be made: " + _explain(e)
+
+
+def _rating_buttons(r, lines, button):
+    """The community rating's questions, one at a time, each with five marks and a way to skip it."""
+    from rosetta_jane.team import QUESTIONS
+    given = r["rated"] or {}
+    left = [q for q in QUESTIONS if q not in given and q not in _panel.get("skipped", set())]
+    if given:
+        lines.append("Your marks: " + ", ".join(f"{given[q]} out of 5" for q in QUESTIONS if q in given) + ".")
+    if not left:
+        return
+    lines.append(f"{QUESTIONS[left[0]]} 1 is rarely, 5 is nearly always. Your mark joins the adapter's community "
+                 "rating, apart from its teacher rating.")
+    for mark in range(1, 6):
+        button(f"{mark} out of 5", "rate", {"question": left[0], "stars": mark})
+    button("Skip this question", "skip", {"question": left[0]})
+
+
+def team_poll():
+    """What the Teams part of the screen shows right now: {"text": ..., "buttons": [...]}. Uses no network."""
+    from rosetta_jane.team import JOINING_WORDS
+    lines, buttons = [], []
+
+    def button(label, what, req=None, kind="team", needs_code=False):
+        buttons.append({"label": label, "kind": kind, "what": what, "req": req or {}, "needs_code": needs_code})
+    if _panel["message"]:
+        lines += [_panel["message"], ""]
+    desk, sharing = _team["desk"], _team["sharing"]
+    r = desk.report() if desk is not None else None
+    if r is not None and r["ended"] is None and r["role"] == "leader":
+        lines += [f"You lead a team with the adapter \"{r['name']}\"." if r["adapter"] else
+                  "You lead a team with no adapter: it pools its devices to run the unchanged model.",
+                  f"Team code: {r['code']}", f"Who can sign on: {JOINING_WORDS[r['joining']]}.",
+                  "A teaching team: start a training run above and only this team's devices do the work. When it "
+                  "is done, offering the adapter to the devices that helped is your choice." if r["kind"] == "teaching"
+                  else ("Begun: the team's answers use the adapter." if r["adapter"] else
+                        "Begun: the team's answers run on the team's devices.") if r["begun"] else
+                  "Not begun yet: answers are still from the unchanged model, through any device."]
+        if r["kind"] == "teaching":
+            lines[0] = "You lead a teaching team: its devices work together on training an adapter."
+        elif r["adapter"] and r["community"]["ratings"]:
+            lines.append(f"Marks from this team so far: {r['community']['average']} out of 5 from "
+                         f"{r['community']['ratings']}.")
+        for card in r["roster"]:
+            role = ", ".join(x for x in ("asks" if card["asks"] else "",
+                                         f"serves layers {card['serves'][0]}-{card['serves'][1] - 1}"
+                                         if card["serves"] else "",
+                                         f"+{card['boost']}% share from teaching points" if card.get("boost") else "") if x)
+            lines.append(f"  {card['who']}: {card['state']}" + (f" ({role})" if role else ""))
+        if r["missing"]:
+            lines.append(f"No signed-on device serves layers {r['missing'][0]}-{r['missing'][-1]} yet. Devices that "
+                         "serve layers have to sign on too.")
+        elif r["missing_for_you"]:
+            lines.append("For your own questions another device has to sign on for layers "
+                         f"{r['missing_for_you'][0]}-{r['missing_for_you'][-1]}: a device does not route through "
+                         "the layers it serves itself.")
+        for q in r["requests"]:
+            lines.append(f"A device at {q['who']} asks to join.")
+            button(f"Approve the device at {q['who']}", "approve", {"request": q["id"]})
+            button(f"Decline the device at {q['who']}", "decline", {"request": q["id"]})
+        if not r["begun"] and r["kind"] == "session":
+            button("Begin anyway" if r["missing"] else "Begin", "begin", {"force": bool(r["missing"])})
+        for mode, label in (("open", "Let anyone in the group sign on"), ("ask", "People ask to join; I approve"),
+                            ("invisible", "Invisible: code or invitation only")):
+            if mode != r["joining"]:
+                button(label, "settings", {"joining": mode})
+        button("See who I can invite…", "devices")
+        for d in _panel["devices"] or []:
+            if not d["in_team"]:
+                what = f"serves layers {d['serves'][0]}-{d['serves'][1] - 1}" if d["serves"] else "not serving"
+                button(("Invited. Invite again: " if d["invited"] else "Invite ")
+                       + (f"{d['name']} at " if d.get("name") else "") + f"{d['addr']} ({what}"
+                       + (", in another team" if d.get("busy") else "") + ")", "invite", {"addr": d["addr"]})
+        for card in r["roster"]:
+            if card.get("id"):
+                button(f"Remove {card['who']} from the team", "remove", {"member": card["id"]})
+        button("End the team", "leave")
+    elif r is not None and r["ended"] is None:
+        lines += [f"You are signed on to the team using \"{r['name']}\"." if r["adapter"] else
+                  "You are signed on to a team with no adapter.",
+                  ("Begun: your answers use the adapter." if r["adapter"] else
+                   "Begun: your answers run on the team's devices.") if r["begun"] else
+                  "Waiting for the leader to begin. Until then answers are from the unchanged model.",
+                  f"{r['members']} devices in the team."
+                  + (" This phone's served layers work for the team." if r["serving"] else ""), ""]
+        if r["kind"] == "teaching":
+            lines[:2] = ["You are signed on to a teaching team: this phone's devices help train an adapter.",
+                         "Your answers are not changed by it."]
+        lines += r["lines"]
+        if r["kind"] == "session":
+            got = r["points"]
+            lines.append("Teaching points with this leader: " + ("press the button to see them." if got is None else
+                         f"{got['balance']}." + (f" In force: {got['boost']}, so your share of the team's computing "
+                                                 f"power is {100 + got['boost']} to everyone else's 100, for "
+                                                 f"{got['minutes']} more minutes." if got["boost"] else "")))
+            button("See my teaching points", "points")
+            for spend in (5, 10, 25):
+                if got is not None and got["balance"] >= spend:
+                    button(f"Spend {spend} points: {spend}% more of the team's computing power for an hour",
+                           "boost", {"points": spend})
+        if r["can_rate"] and r["begun"]:
+            if _blind["state"] == "running":
+                lines.append("Blind comparison: getting two answers…")
+            elif _blind["state"] == "ready":
+                lines += ["", f"Blind comparison. Question: {_blind['question']}", f"Answer A: {_blind['a']}",
+                          f"Answer B: {_blind['b']}", "One is the adapter's, one the unchanged model's. Which was right?"]
+                for choice, label in (("a", "A was right"), ("b", "B was right"), ("both", "Both were"),
+                                      ("neither", "Neither was")):
+                    button(label, "pick", {"id": _blind["id"], "choice": choice})
+            else:
+                button("Blind comparison: a trick question", "blind")
+                button("Blind comparison: the question in the Ask box", "blind", {"own": True})
+            _rating_buttons(r, lines, button)
+        button("Leave the team", "leave")
+    else:
+        if r is not None:
+            lines.append(f"Your last team is over: {r['ended']}. Answers are from the unchanged model.")
+            if r["can_rate"]:
+                _rating_buttons(r, lines, button)
+        else:
+            lines.append("You are not in a team. Answers are from the unchanged model.")
+        waiting = desk.waiting() if desk is not None else None
+        looked = _panel["looked"]
+        if waiting is not None:
+            lines += ["", f"You asked to join the team using \"{waiting['name']}\": "
+                          + ("waiting for its leader." if waiting["state"] == "waiting" else waiting["state"] + ".")]
+            button("Cancel the request" if waiting["state"] == "waiting" else "Clear", "cancel")
+        elif looked:
+            lines += ["", "Before you sign on:"] + looked["lines"]
+            if looked["fits"]:
+                button((f"Ask to join the team using \"{looked['name']}\"" if looked["asks"] else
+                        f"Sign on to the team using \"{looked['name']}\""), "join", looked["req"])
+            button("Never mind", "forget")
+        else:
+            button("Look at the team with this code", "look", needs_code=True)
+            button("Find teams in my group", "list")
+            button("Quick match: find an open team", "quick")
+            button("Lead a team with no adapter (pool devices for the unchanged model)", "create")
+            button("Lead a teaching team (train an adapter together)", "create", {"kind": "teaching"})
+        found = _panel["found"] or {}
+        for kind, label in (("invitations", "You are invited"), ("teams", "Session team"),
+                            ("teaching", "Teaching team")):
+            for t in found.get(kind, []):
+                lines.append(f"{label}: model {t.get('model_name') or t['model'][:8]}, "
+                             + (f"adapter \"{t['name']}\"" if t["adapter"] else "no adapter")
+                             + f", {t['members']}/{t['limit']} devices, {'begun' if t['begun'] else 'gathering'}, "
+                             f"{JOINING_WORDS[t['joining']]}.")
+                button(f"Look at \"{t['name']}\"", "look", {"team": t["team"]})
+    if desk is not None:
+        button("Invite lists: you are hidden. Press to be shown." if desk.hidden else
+               "Invite lists: leaders can see this phone. Press to hide.", "settings", {"hidden": not desk.hidden})
+    waiting_invites = len(desk.invitations._held) if desk is not None else 0
+    if waiting_invites and not (_panel["found"] or {}).get("invitations"):
+        lines.append(f"You have {waiting_invites} invitation{'s' if waiting_invites != 1 else ''}. "
+                     "Press 'Find teams in my group'.")
+    for offer in sharing.offers() if sharing is not None else []:
+        lines += ["", f"An adapter this phone helped train is on offer to you ({offer['examples']} pieces of work "
+                      "done here)."]
+        shown = _panel["offer"]
+        if shown and shown["run"] == offer["run"]:
+            lines += shown["lines"]
+            button("Take a copy (nothing is applied)", "take", {"run": offer["run"]}, kind="share")
+        else:
+            button("Look at the adapter on offer", "look", {"run": offer["run"]}, kind="share")
+    for row in sharing.report() if sharing is not None else []:
+        lines.append(f"Offering \"{row['name']}\" to its helpers: {row['taken']} of {row['helpers']} have taken a copy.")
+        button(f"Stop offering \"{row['name']}\"", "close", {"run": row["run"]}, kind="share")
+    return json.dumps({"text": "\n".join(lines), "buttons": buttons})

@@ -273,7 +273,8 @@ def test_an_adapter_someone_shared_can_be_added_tried_and_scored(rig, tmp_path):
     assert post_raw(base, "/api/rosetta/adapters/import?name=friends-model", blob, "wrong")[0] == 401
     status, body = post_raw(base, "/api/rosetta/adapters/import?name=friends-model", blob, token)
     assert status == 200 and body["imported"] == "friends-model"
-    assert {"name": "friends-model", "received": True, "scored": False, "my_score": False} in body["adapter_details"]
+    assert {"name": "friends-model", "received": True, "scored": False, "my_score": False, "helpers": 0,
+            "continued": False, "community": None, "flattery": None} in body["adapter_details"]
     assert post_raw(base, "/api/rosetta/adapters/import?name=friends-model", blob, token)[0] == 400   # no overwriting
     job = lambda: call(base, "/api/rosetta/status")[1]["adapter_job"]
 
@@ -326,7 +327,8 @@ def test_an_adapter_someone_shared_can_be_added_tried_and_scored(rig, tmp_path):
     assert scored["result"]["share_text"].startswith("Rosetta-Jane score card: friends-model")
     status, shown = call(base, "/api/rosetta/adapters/friends-model/score-card", token=token)
     assert shown["score"] == card                  # my own score is the one offered for sharing
-    assert {"name": "friends-model", "received": True, "scored": False, "my_score": True} in \
+    assert {"name": "friends-model", "received": True, "scored": False, "my_score": True, "helpers": 0,
+            "continued": False, "community": None, "flattery": None} in \
         call(base, "/api/rosetta/status")[1]["adapter_details"]
 
     for bad in ({"name": "nope", "items": items}, {"name": "friends-model", "items": []},

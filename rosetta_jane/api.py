@@ -7,6 +7,9 @@ swarm. It listens on this computer only unless told otherwise.
 Covered: /api/version, /api/tags, /api/show, /api/ps, /api/chat, /api/generate,
 and the OpenAI-style /v1/models and /v1/chat/completions, with streaming.
 /api/rosetta/status reports what the swarm looks like from this device.
+/api/rosetta/team/... is the co-op side: lead a team with an adapter, sign on to
+one, begin, leave (see team.py). /api/rosetta/share/... shares a finished adapter
+with the devices that helped train it (see helpers.py).
 Not covered: embeddings, model downloads, images. Those return a clear error;
 NOMAD keeps embeddings on its own machine.
 """
@@ -24,6 +27,7 @@ from . import __version__
 from .layers import LocalEnds
 from .net import Node
 from .swarm import Generation, NoRoute
+from .team import NoTeam
 
 MAX_BODY = 32 << 20
 MAX_UPLOAD = 600 << 20         # an adapter someone shared, as a zip
@@ -56,6 +60,31 @@ class Gateway:
         self.max_prompt_tokens = max_prompt_tokens
         self._busy = threading.Lock()             # one answer at a time through this gateway
         self.last: Optional[dict] = None          # how the most recent answer went
+        from .helpers import Sharing
+        from .team import TeamDesk
+
+        def shapes(targets):
+            from .lora import shapes_from_files
+            if not self.model_dir:
+                raise ValueError("this needs the model folder; this gateway was started without it")
+            return shapes_from_files(self.model_dir, targets)
+
+        def prefix():
+            from .layers import model_shape
+            if not self.model_dir:
+                raise ValueError("leading a team needs the model folder; this gateway was started without it")
+            return model_shape(self.model_dir)[0]
+        self.desk = TeamDesk(node, ends, layer_prefix=prefix, shapes=shapes, work_dir=work_dir, service=service,
+                             whole=auditor is not None, find_wait=find_wait,
+                             helped=service.helped if service is not None else self._tickets(work_dir),
+                             model_name=os.path.basename(os.path.normpath(model_dir)) if model_dir else None)
+        self.sharing = Sharing(node, service.helped if service is not None else None).attach()
+
+    @staticmethod
+    def _tickets(work_dir):
+        """This device's tickets from teaching, kept in its work folder even when it serves nothing now."""
+        from .helpers import HelpLog
+        return HelpLog(os.path.join(work_dir, "helped.json")) if work_dir else None
 
     def context_length(self) -> int:
         limit = getattr(self.tokenizer, "model_max_length", None)
@@ -90,7 +119,11 @@ class Gateway:
                 "last_answer": self.last, "controls": bool(self.control_token),
                 "service": self.service_report(), "training": self.job.report() if self.job else None,
                 "adapters": self.adapters(), "adapter_details": self.adapter_details(),
-                "adapter_job": self.side.report() if self.side else None}
+                "adapter_job": self.side.report() if self.side else None,
+                "team": self.team_report(), "team_settings": self.team_settings(),
+                "team_waiting": self.desk.waiting(),
+                "invitations": len(self.invitations._held),
+                "sharing": self.sharing.report(), "offers": self.sharing.offers()}
 
     def service_report(self) -> Optional[dict]:
         s = self.service
@@ -106,6 +139,67 @@ class Gateway:
     def adapter_details(self) -> list:
         from .control import adapters_info
         return adapters_info(self.work_dir) if self.work_dir else []
+
+    # -- teams: an adapter applied because people signed on (the work is in team.TeamDesk) --------------
+    @property
+    def team(self):
+        """The team this device leads or has signed on to, if any."""
+        return self.desk.team
+
+    @property
+    def invitations(self):
+        return self.desk.invitations
+
+    def team_settings(self) -> dict:
+        return self.desk.settings()
+
+    def team_report(self) -> Optional[dict]:
+        return self.desk.report()
+
+    def lead_team(self, adapter_dir=None, name=None, joining=None, limit=None, code=None, serve: bool = True):
+        return self.desk.lead(adapter_dir, name, joining, limit, code, serve)
+
+    def look_team(self, req: dict) -> dict:
+        return self.desk.look(req)
+
+    def join_team(self, req: dict):
+        return self.desk.join(req)
+
+    def leave_team(self) -> None:
+        self.desk.leave()
+
+    def team_control(self, what: str, req: dict) -> dict:
+        return self.desk.control(what, req)
+
+    def share_control(self, what: str, req: dict) -> dict:
+        """Share a finished adapter with the devices that helped train it, or take a copy of one offered."""
+        from .control import _NAME, past_runs
+        from .team import fact_lines
+        run = req.get("run") if isinstance(req.get("run"), str) else ""
+        if not self.work_dir:
+            raise ValueError("adapters are not set up on this gateway")
+        if what == "open":
+            name = req.get("name")
+            if not isinstance(name, str) or not _NAME.match(name) or name not in past_runs(self.work_dir):
+                raise ValueError("no adapter by that name")
+            self.sharing.open(os.path.join(self.work_dir, "adapters", name), self.ends.fingerprint)
+        elif what == "close":
+            self.sharing.close(run)
+        elif what == "look":
+            try:
+                found = self.sharing.look(run)
+            except KeyError as e:
+                raise ValueError(str(e.args[0])) from None
+            return {"look": {**found, "lines": fact_lines(found)[1:]}}
+        elif what == "take":
+            try:
+                kept = self.sharing.take(run, self.work_dir, self.ends.fingerprint, req.get("name"))
+            except (KeyError, PermissionError) as e:
+                raise ValueError(str(e.args[0])) from None
+            return {"taken": kept, "adapter_details": self.adapter_details()}
+        else:
+            raise KeyError(what)
+        return {"sharing": self.sharing.report(), "offers": self.sharing.offers()}
 
     def _idle(self) -> None:
         if (self.job is not None and self.job.running()) or (self.side is not None and self.side.running()):
@@ -152,6 +246,44 @@ class Gateway:
             return {"score": result, "lines": describe(result), "share_text": share_text(result)}
         self.side = AdapterJob("score", name, work, len(examples))
         return {"adapter_job": self.side.report()}
+
+    def check_flattery(self, req: dict):
+        """Run the flattery check on an adapter held here: measured against the unchanged model."""
+        from .control import AdapterJob, flattery_examples, save_fact
+        from .flattery import describe
+        self._idle()
+        name = req.get("name")
+        trainer = self._holding(name)
+        examples = flattery_examples(self.tokenizer, min(1024, self.max_prompt_tokens))
+
+        def work(job):
+            with self._busy:
+                result = trainer.flattery(examples)
+            job.done_count = len(examples)
+            save_fact(os.path.join(self.work_dir, "adapters", name), "flattery", result)
+            return {"flattery": result, "lines": describe(result)}
+        self.side = AdapterJob("flattery", name, work, len(examples))
+        return {"adapter_job": self.side.report()}
+
+    def blind(self, req: dict) -> dict:
+        """A blind comparison for a member of a team with an adapter: the same question answered by the
+        team (with the adapter) and by the unchanged model, returned as A and B with nothing to say which
+        is which. The member then says which was right ('pick'), and that joins the community rating."""
+        from .flattery import trick_question
+        t = self.team
+        if t is None or not t.active() or t.use().plain:
+            raise ValueError("blind comparisons are for a team that has begun and uses an adapter")
+        if t.role == "leader":
+            raise ValueError("blind comparisons are made by the team's members; a leader does not rate their "
+                             "own adapter")
+        trick = req.get("messages") is None
+        messages = [{"role": "user", "content": trick_question()}] if trick else req["messages"]
+        ids = self.chat_ids(messages)
+        options = {"temperature": 0, "num_predict": req.get("max_new", 96)}
+        with_adapter = self.answer(ids, options, lambda text: None)["text"]
+        unchanged = self.answer(ids, options, lambda text: None, plain=True)["text"]
+        shown = self.desk.blind_put(with_adapter, unchanged, trick)
+        return {"blind": {**shown, "question": messages[-1]["content"]}}
 
     def try_adapter(self, req: dict):
         """Answer each question twice, without the adapter and with it. A trial: nothing is applied."""
@@ -215,10 +347,23 @@ class Gateway:
             return self.score_adapter(req)
         if path == "/api/rosetta/adapters/try":
             return self.try_adapter(req)
+        if path == "/api/rosetta/adapters/flattery":
+            return self.check_flattery(req)
+        if path == "/api/rosetta/team/blind":
+            try:
+                return self.blind(req)
+            except NoRoute as e:
+                raise ValueError(f"the group cannot answer right now: {e}") from None
         if path == "/api/rosetta/adapters/stop":
             if self.side is not None:
                 self.side.stop()
             return {"adapter_job": self.side.report() if self.side else None}
+        for prefix, handle in (("/api/rosetta/team/", self.team_control), ("/api/rosetta/share/", self.share_control)):
+            if path.startswith(prefix):
+                try:
+                    return handle(path[len(prefix):], req)
+                except (NoTeam, PermissionError, RuntimeError) as e:
+                    raise ValueError(str(e)) from None
         raise KeyError(path)
 
     # -- prompts -----------------------------------------------------------------
@@ -244,7 +389,8 @@ class Gateway:
         return list(self.tokenizer(prompt)["input_ids"])
 
     # -- answering -----------------------------------------------------------------
-    def answer(self, ids: List[int], options: dict, emit: Callable[[str], None]) -> dict:
+    def answer(self, ids: List[int], options: dict, emit: Callable[[str], None], plain: bool = False) -> dict:
+        """plain=True answers with the unchanged model whatever team this device is in (for comparisons)."""
         if len(ids) > self.max_prompt_tokens:
             raise ValueError(f"prompt is {len(ids)} tokens; this gateway accepts up to {self.max_prompt_tokens}")
         temperature = float(options.get("temperature", 0.8))
@@ -280,27 +426,35 @@ class Gateway:
                 shown = text
             return True
 
+        t = self.team
+        if t is not None and t.ended is None and t.kind == "teaching":
+            raise ValueError("this device is in a teaching team, which gives its power to training. "
+                             "Leave the teaching team to ask questions.")
         started = time.time()
         with self._busy:
+            # In a team that has begun, the answer comes from the model with the team's adapter.
+            # In every other case it is the unchanged model.
+            team = None if plain else self.desk.use()
             gen = Generation(self.node, self.ends, variant=self.variant, find_wait=self.find_wait,
                              redundancy=self.redundancy, auditor=self.auditor,
                              require_verified=self.require_verified, tolerance=self.tolerance,
                              audit_rate=self.audit_rate, canaries=self.canaries,
-                             canary_rate=self.canary_rate)
+                             canary_rate=self.canary_rate, team=team)
             out = gen.run(ids, limit, temperature=temperature, top_p=top_p,
                           seed=int(seed) if seed is not None else None, stop_ids=stop_ids, on_token=on_token)
         if reason == "length" and len(out) < limit:
             reason = "stop"
         self.last = {"at": _now(), "peers_used": sum(len(h.replicas()) for h in gen.route),
                      "checked_steps": gen.verified_steps, "unchecked_steps": gen.unverified_steps,
-                     "peers_blocked": len(gen.caught), "reroutes": gen.reroutes}
+                     "peers_blocked": len(gen.caught), "reroutes": gen.reroutes,
+                     "team": team.id if team is not None else None}
         return {"done": True, "done_reason": reason, "total_duration": int((time.time() - started) * 1e9),
                 "prompt_eval_count": len(ids), "eval_count": len(produced), "text": shown,
                 "peers_used": sum(len(h.replicas()) for h in gen.route), "reroutes": gen.reroutes,
                 "checked_steps": gen.verified_steps, "unchecked_steps": gen.unverified_steps,
                 "disputes": gen.disputes, "peers_blocked": len(gen.caught), "spot_audits": gen.spot_audits,
                 "redundancy": gen.redundancy, "known_answer_tests": gen.known_answer_tests,
-                "known_answers_spent": gen.tests_spent}
+                "known_answers_spent": gen.tests_spent, "team": team.id if team is not None else None}
 
     # -- HTTP ------------------------------------------------------------------------
     def serve(self, listen: str = "127.0.0.1:11435") -> ThreadingHTTPServer:

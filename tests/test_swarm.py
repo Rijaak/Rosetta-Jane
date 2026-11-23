@@ -169,12 +169,17 @@ def test_local_network_announcements_bring_nodes_together():
 
 
 def test_bad_announcements_are_rejected():
-    good = [{"model": "ab" * 8, "variant": "float32", "layers": [2, 5], "hidden": 32, "free": 3, "train": False}]
+    good = [{"model": "ab" * 8, "variant": "float32", "layers": [2, 5], "hidden": 32, "free": 3, "train": False,
+             "teams": ["0123456789abcdef"]}]
     assert clean_services(good) == good
+    older = [{k: v for k, v in good[0].items() if k != "teams"}]      # a peer from before teams existed
+    assert clean_services(older) == [{**older[0], "teams": []}]
     for bad in ([{"model": "ab" * 8, "layers": [5, 2], "hidden": 32}],
                 [{"model": "../../etc", "layers": [1, 2], "hidden": 32}],
                 [{"model": "ab" * 8, "layers": [1, 2], "hidden": -1}],
                 [{"model": "ab" * 8, "layers": [1, 2], "hidden": 32, "variant": "x" * 99}],
+                [{**good[0], "teams": ["not a team id"]}], [{**good[0], "teams": ["0123456789abcdef"] * 99}],
+                [{**good[0], "teams": "0123456789abcdef"}],
                 "nope", [good[0]] * 50):
         with pytest.raises(ValueError):
             clean_services(bad)

@@ -290,14 +290,19 @@ class Stack:
         return self.layers[first - self.start:last - self.start]
 
     # -- answering: new tokens in, continuing from what was seen before ------------------------
-    def step(self, first: int, last: int, x: np.ndarray, cache: Optional[list]) -> Tuple[np.ndarray, list]:
-        """Apply layers [first, last) to new hidden states [tokens, hidden]. Returns (output, new cache)."""
+    def step(self, first: int, last: int, x: np.ndarray, cache: Optional[list],
+             lora: Optional[dict] = None) -> Tuple[np.ndarray, list]:
+        """Apply layers [first, last) to new hidden states [tokens, hidden]. Returns (output, new cache).
+
+        lora, when given, is a team's adapter as {"<layer>.<module>": (A, B, scale)}: the answer then
+        comes from the model with that adapter. Without it this is the unchanged model.
+        """
         layers = self._pick(first, last)
         x = np.ascontiguousarray(x, dtype=f32)
         new_cache = []
         for i, layer in enumerate(layers):
-            x, kv = self._attend(layer, x, None if cache is None else cache[i])
-            x = self._feed(layer, x)
+            x, kv = self._attend(layer, x, None if cache is None else cache[i], lora)
+            x = self._feed(layer, x, lora)
             new_cache.append(kv)
         return x, new_cache
 

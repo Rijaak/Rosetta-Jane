@@ -105,12 +105,18 @@ class Applied:
     """Apply adapters to a run of layers for the length of a `with` block."""
 
     def __init__(self, layers: Sequence[nn.Module], first: int, targets: Sequence[str],
-                 adapters: Dict[str, torch.Tensor], scale: float):
+                 adapters: Dict[str, torch.Tensor], scale: float, place: bool = False):
+        """With place=True each adapter is moved to the device its module is on, once, here.
+        That is for answering, where a model may be spread over several graphics cards."""
         self._pairs = []
         for offset, layer in enumerate(layers):
             for path, module in find_targets(layer, targets).items():
                 name = f"{first + offset}.{path}"
-                self._pairs.append((module, adapters[f"{name}.A"], adapters[f"{name}.B"]))
+                a, b = adapters[f"{name}.A"], adapters[f"{name}.B"]
+                if place:
+                    where = next((p.device for p in module.parameters()), a.device)
+                    a, b = a.to(where), b.to(where)
+                self._pairs.append((module, a, b))
         self._scale = scale
         self._handles = []
 

@@ -157,13 +157,71 @@ class LayerServer:
         self._sessions: List[dict] = []
         self.steps_served = 0
         self.tokens_served = 0
+        self._teams: dict = {}                    # teams this device's owner has signed it on to
+        self.team_steps_served = 0
+        from .fair import FairTurns
+        self._fair = FairTurns()                  # shares this device's time between the people using it
+        from .helpers import HelpLog
+        self.helped = HelpLog(os.path.join(work_dir, "helped.json"))   # training runs worked on, and their tickets
+        self._node_id = ""
 
     def service(self) -> dict:
         with self._lock:
             self._expire()
             free = max(0, self.max_sessions - len(self._sessions))
+            teams = sorted(self._teams)
         return {"model": self.fingerprint, "variant": self.variant, "layers": [self.start, self.end],
-                "hidden": self.hidden, "free": free, "train": self.training}
+                "hidden": self.hidden, "free": free, "train": self.training, "teams": teams}
+
+    # -- teams: an adapter applied because this device's owner signed on, and only for that team -------
+    def join_team(self, team_id: str, blob: Optional[bytes], rank=None, alpha=None, targets=None,
+                  weight_of=None) -> None:
+        """Hold a team's adapter for this device's layers. Sessions opened for that team use it; no others do.
+        weight_of(tag, proof) says how large a share of this device a member's work gets (100 is plain)."""
+        from safetensors.torch import load as st_load
+
+        from .lora import Applied, check_adapters, check_spec, keys_for, shapes_of_layers
+        from .net import MAX_TEAMS, _ID_RE
+        if not (isinstance(team_id, str) and _ID_RE.match(team_id)):
+            raise ValueError("bad team id")
+        if blob is None:                          # a team with no adapter: these layers serve it unchanged
+            with self._lock:
+                if team_id not in self._teams and len(self._teams) >= MAX_TEAMS:
+                    raise RuntimeError(f"this device is already signed on to {MAX_TEAMS} teams")
+                self._teams[team_id] = {"adapters": None, "weight_of": weight_of}
+            return
+        rank, alpha, targets = check_spec(rank, alpha, targets)
+        shapes = shapes_of_layers(self._layers, self.start, targets)
+        if not shapes:
+            raise ValueError(f"these layers have no modules named {targets}")
+        if not blob or len(blob) > 1 << 30:
+            raise ValueError("adapters missing or too large")
+        try:
+            sent = st_load(blob)
+            mine = {k: sent[k] for k in keys_for(shapes, self.start, self.end)}
+        except KeyError:
+            raise ValueError("the team's adapter does not cover this device's layers") from None
+        except Exception as e:
+            raise ValueError(f"the team's adapter could not be read: {e}") from None
+        check_adapters(mine, shapes, rank)
+        mine = {k: v.to(self._device, torch.float32) for k, v in mine.items()}
+        whole = Applied(self._layers, self.start, targets, mine, alpha / rank, place=True)   # also proves it fits
+        del whole
+        with self._lock:
+            if team_id not in self._teams and len(self._teams) >= MAX_TEAMS:
+                raise RuntimeError(f"this device is already signed on to {MAX_TEAMS} teams")
+            self._teams[team_id] = {"adapters": mine, "scale": alpha / rank, "targets": targets,
+                                    "weight_of": weight_of}
+
+    def leave_team(self, team_id: str) -> None:
+        """Let a team's adapter go. Its sessions end; everything else carries on untouched."""
+        with self._lock:
+            self._teams.pop(team_id, None)
+            self._sessions[:] = [s for s in self._sessions if s.get("team") != team_id]
+
+    def teams(self) -> List[str]:
+        with self._lock:
+            return sorted(self._teams)
 
     def _expire(self) -> None:
         cutoff = time.time() - self.session_ttl
@@ -178,8 +236,10 @@ class LayerServer:
             node.handlers[op] = getattr(self, "_" + op)
         node.disconnect_hooks.append(self._drop)
         node.services_fn = lambda: [] if self.paused else [self.service()]
+        self._node_id = node.node_id
 
     def _open(self, ch: Channel, header: dict, tensor, state: dict) -> None:
+        from .lora import Applied
         if self.paused:
             raise RuntimeError("this peer is not serving right now")
         x, y = header.get("start"), header.get("end")
@@ -187,6 +247,7 @@ class LayerServer:
             raise ValueError("this peer serves a different model")
         if not (isinstance(x, int) and isinstance(y, int) and self.start <= x < y <= self.end):
             raise ValueError(f"this peer serves layers {self.start}:{self.end}")
+        team = header.get("team")
         with self._lock:
             self._drop_locked(state)
             self._expire()
@@ -194,9 +255,19 @@ class LayerServer:
                 raise RuntimeError("busy: no free session slots")
             session = {"layers": nn.ModuleList(self._layers[x - self.start:y - self.start]),
                        "cache": None, "tokens": 0, "last": time.time()}
+            if team is not None:
+                held = self._teams.get(team) if isinstance(team, str) else None
+                if held is None:
+                    raise RuntimeError("this peer has not signed on to that team")
+                session["team"] = team
+                if isinstance(header.get("as"), str) and len(header["as"]) == 16:
+                    session["as"], session["proof"] = header["as"], header.get("proof")
+                if held["adapters"] is not None:
+                    session["applied"] = Applied(session["layers"], x, held["targets"], held["adapters"],
+                                                 held["scale"], place=True)
             self._sessions.append(session)
             state["session"] = session
-        ch.send({"op": "open_ok", "variant": self.variant})
+        ch.send({"op": "open_ok", "variant": self.variant, **({"team": team} if team is not None else {})})
 
     def _step(self, ch: Channel, header: dict, tensor, state: dict) -> None:
         session = state.get("session")
@@ -207,9 +278,24 @@ class LayerServer:
             raise ProtocolError("hidden states must have shape [1, tokens, hidden size]")
         if session["tokens"] + tensor.shape[1] > self.max_tokens:
             raise RuntimeError(f"session is limited to {self.max_tokens} tokens")
-        with self._lock, torch.no_grad():
-            out, session["cache"] = _run(self._decoder, session["layers"],
-                                         tensor.to(self._device, self._dtype), session["cache"])
+        applied = session.get("applied")
+        flow, weight = id(session), 100
+        if "as" in session:                       # a team member's work: all of it shares one place in the queue
+            held = self._teams.get(session["team"]) or {}
+            flow = (session["team"], session["as"])
+            if held.get("weight_of") is not None:
+                weight = held["weight_of"](session["as"], session.get("proof"))
+        with self._fair.turn(flow, weight, tensor.shape[1]), self._lock, torch.no_grad():
+            if not any(session is s for s in self._sessions):
+                raise RuntimeError("no open session (its team may have ended)")
+            if applied is None:                   # the unchanged model
+                out, session["cache"] = _run(self._decoder, session["layers"],
+                                             tensor.to(self._device, self._dtype), session["cache"])
+            else:                                 # a team this device's owner signed it on to
+                with applied:
+                    out, session["cache"] = _run(self._decoder, session["layers"],
+                                                 tensor.to(self._device, self._dtype), session["cache"])
+            self.team_steps_served += "team" in session
             session["tokens"] += tensor.shape[1]
             session["last"] = time.time()
             self.steps_served += 1
@@ -243,6 +329,8 @@ class LayerServer:
             raise RuntimeError("this peer is not serving right now")
         if not self.training:
             raise RuntimeError("this peer has not agreed to help with training")
+        if header.get("team") is not None and header.get("team") not in self._teams:
+            raise RuntimeError("this peer has not signed on to that team")
         x, y = header.get("start"), header.get("end")
         if header.get("model") != self.fingerprint:
             raise ValueError("this peer serves a different model")
@@ -260,7 +348,8 @@ class LayerServer:
                 raise RuntimeError("busy: no free session slots")
             session = {"layers": nn.ModuleList(layers), "first": x, "rank": rank, "scale": alpha / rank,
                        "targets": targets, "shapes": shapes, "adapters": None, "graph": None,
-                       "last": time.time()}
+                       "last": time.time(),
+                       "run": self.helped.note(header.get("run"), header.get("ticket"), self._node_id)}
             self._sessions.append(session)
             state["training"] = session
         ch.send({"op": "t_open_ok", "variant": self.variant})
@@ -310,6 +399,7 @@ class LayerServer:
             out.backward(tensor.to(out.device, out.dtype))
             session["graph"] = None
             self.examples_trained += 1
+        self.helped.count(session.get("run"))
         ch.send({"op": "t_bwd_ok"}, tensor=h.grad)
 
     def _t_grads(self, ch: Channel, header: dict, tensor, state: dict) -> None:
@@ -361,10 +451,31 @@ class LocalEnds:
         self.hidden = int(model.config.hidden_size)
         self.eos_token_id = model.config.eos_token_id
 
+    def fit_team(self, team):
+        """Check a team's adapter against this device's own first layers, and get it ready to apply."""
+        from .lora import Applied, check_adapters, keys_for, shapes_of_layers
+
+        def make():
+            shapes = shapes_of_layers(self._layers, 0, team.targets)
+            try:
+                mine = {k: torch.from_numpy(team.adapters[k]) for k in keys_for(shapes, 0, self.own_layers)}
+                check_adapters(mine, shapes, team.rank)
+            except (KeyError, ValueError):
+                raise ValueError("the team's adapter does not fit this device's own layers") from None
+            if not mine:
+                raise ValueError(f"these layers have no modules named {team.targets}")
+            return Applied(self._layers, 0, team.targets, {k: v.to(torch.float32) for k, v in mine.items()},
+                           team.scale, place=True)
+        return team.memo(("ends", id(self)), make)
+
     @torch.no_grad()
-    def head(self, new_ids: List[int], cache):
+    def head(self, new_ids: List[int], cache, team=None):
+        """This device's own first layers. With a team, the team's adapter is applied to them."""
         ids = torch.tensor([new_ids], dtype=torch.long, device=self._embed.weight.device)
-        return _run(self._decoder, self._layers, self._embed(ids), cache)
+        if team is None or team.plain:
+            return _run(self._decoder, self._layers, self._embed(ids), cache)
+        with self.fit_team(team):
+            return _run(self._decoder, self._layers, self._embed(ids), cache)
 
     @torch.no_grad()
     def logits(self, h_last: torch.Tensor) -> torch.Tensor:
@@ -396,15 +507,16 @@ class LocalAuditor:
         self._loaded: Optional[tuple] = None      # (start, end, decoder, layers); one range kept at a time
         self.audits = 0
 
-    def compute(self, start: int, end: int, blocks: List[torch.Tensor]) -> torch.Tensor:
+    def compute(self, start: int, end: int, blocks: List[torch.Tensor], team=None) -> torch.Tensor:
         """True output of layers [start, end) for everything a peer has been sent so far.
 
         A long run of layers is worked through a few at a time, so this device never
-        needs room for more than max_layers of them.
+        needs room for more than max_layers of them. With a team, the truth is the model
+        with the team's adapter, which this device must hold for those layers.
         """
         h = torch.cat(blocks, dim=1)
         for a in range(start, end, self.max_layers):
-            h = self._some(a, min(a + self.max_layers, end), h)
+            h = self._some(a, min(a + self.max_layers, end), h, team)
         self.audits += 1
         return h.float().cpu()
 
@@ -451,7 +563,7 @@ class LocalAuditor:
         ref = next(p for p in layers[0].parameters())
         return decoder, layers, ref.device, (ref.dtype if ref.is_floating_point() else torch.float16)
 
-    def _some(self, start: int, end: int, h: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def _some(self, start: int, end: int, h: Optional[torch.Tensor], team=None) -> Optional[torch.Tensor]:
         if self._loaded is None or self._loaded[:2] != (start, end):
             self._loaded = None                   # free the previous range before loading another
             model = _load(_slice(self._model_dir, self._work_dir, start, end, False, self._allow_untested),
@@ -466,5 +578,18 @@ class LocalAuditor:
         ref = next(p for p in layers[0].parameters())
         dtype = ref.dtype if ref.is_floating_point() else torch.float16
         with torch.no_grad():
-            out, _ = _run(decoder, layers, h.to(ref.device, dtype), None)
+            if team is None or team.plain:
+                out, _ = _run(decoder, layers, h.to(ref.device, dtype), None)
+            else:
+                from .lora import Applied, check_adapters, keys_for, shapes_of_layers
+                shapes = shapes_of_layers(layers, start, team.targets)
+                try:
+                    live = {k: torch.from_numpy(team.adapters[k]).to(torch.float32)
+                            for k in keys_for(shapes, start, end)}
+                    check_adapters(live, shapes, team.rank)
+                except (KeyError, ValueError):
+                    raise ValueError("rechecking a team's answers needs the team's whole adapter, "
+                                     "and it does not fit these layers") from None
+                with Applied(layers, start, team.targets, live, team.scale, place=True):
+                    out, _ = _run(decoder, layers, h.to(ref.device, dtype), None)
         return out

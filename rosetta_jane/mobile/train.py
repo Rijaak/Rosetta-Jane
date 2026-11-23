@@ -58,14 +58,33 @@ def _flat(tensors: Dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate([tensors[k].ravel() for k in sorted(tensors)])[None] if tensors else np.zeros((1, 0), f32)
 
 
+def all_shapes(model_dir: str, prefix: str, targets: Sequence[str]) -> Dict[str, Tuple[int, int]]:
+    """Every adapter a model takes for these targets, read from the weight files without loading them."""
+    from .engine import scan
+    found = scan(model_dir)
+    out = {}
+    for key, (_, shape, _) in found.items():
+        if key.startswith(prefix) and key.endswith(".weight") and len(shape) == 2:
+            index, _, path = key[len(prefix):-len(".weight")].partition(".")
+            if index.isdigit() and path.split(".")[-1] in targets:
+                out[f"{int(index)}.{path}"] = (int(shape[1]), int(shape[0]))
+    for f in {id(v[0]): v[0] for v in found.values()}.values():
+        f.close()
+    if not out:
+        raise ValueError(f"no modules named {list(targets)} found in this model")
+    return out
+
+
 class Trainer:
     def __init__(self, node, ends: Ends, work_dir: str, *, total_steps: int, accum: int = 16, lr: float = 2e-4,
                  warmup_steps: int = 20, max_grad_norm: float = 1.0, rank: int = 16, alpha: float = 32.0,
                  targets: Sequence[str] = DEFAULT_TARGETS, seed: int = 0, save_every: int = 25,
                  run_id: str = "run", redundancy: Optional[int] = None, tolerance: float = 0.02,
                  find_wait: float = 15.0, rpc_timeout: float = 300.0, max_redo: int = 8,
-                 init: Optional[Dict[str, np.ndarray]] = None):
+                 init: Optional[Dict[str, np.ndarray]] = None, record_helpers: bool = True,
+                 team: Optional[str] = None):
         from .peer import check_spec
+        self.team = team                           # train inside a team: only its signed-on devices do the work
         self.node, self.ends = node, ends
         self.rank, self.alpha, self.targets = check_spec(rank, alpha, list(targets))
         self.scale = self.alpha / self.rank
@@ -82,6 +101,10 @@ class Trainer:
         self.seed, self.run_id = seed, run_id
         self.dir = os.path.join(work_dir, f"train-{run_id}")
         os.makedirs(self.dir, exist_ok=True)
+        from ..helpers import RunBook              # who helped, so the result can be shared with them
+        self.book = RunBook(self.dir) if record_helpers else None
+        self._pending: List[str] = []
+        self.history: List[dict] = []              # the adapters this run stands on, oldest first
         self.redundancy, self.tolerance = redundancy, tolerance
         self.find_wait, self.rpc_timeout, self.max_redo = find_wait, rpc_timeout, max_redo
         self.route: List[Hop] = []
@@ -93,21 +116,7 @@ class Trainer:
         self.checked = self.unchecked = self.disputes = self.redos = 0
 
     def _all_shapes(self) -> Dict[str, Tuple[int, int]]:
-        """Every adapter this model takes, read from the weight files without loading them."""
-        from .engine import scan
-        found = scan(self.ends.stack and self._model_dir())
-        prefix = self.ends.stack.prefix
-        out = {}
-        for key, (_, shape, _) in found.items():
-            if key.startswith(prefix) and key.endswith(".weight") and len(shape) == 2:
-                index, _, path = key[len(prefix):-len(".weight")].partition(".")
-                if index.isdigit() and path.split(".")[-1] in self.targets:
-                    out[f"{int(index)}.{path}"] = (int(shape[1]), int(shape[0]))
-        for f in {id(v[0]): v[0] for v in found.values()}.values():
-            f.close()
-        if not out:
-            raise ValueError(f"no modules named {list(self.targets)} found in this model")
-        return out
+        return all_shapes(self._model_dir(), self.ends.stack.prefix, self.targets)
 
     def _model_dir(self) -> str:
         return os.path.dirname(self.ends._embed_file.path)
@@ -132,6 +141,8 @@ class Trainer:
             json.dump({"step": self.step, "rank": self.rank, "alpha": self.alpha, "targets": self.targets}, f)
         shutil.rmtree(self._ckpt(), ignore_errors=True)
         os.replace(tmp, self._ckpt())
+        if self.book is not None:
+            self.book.save()
 
     def resume(self) -> bool:
         done = os.path.join(self._ckpt(), "done.json")
@@ -174,8 +185,13 @@ class Trainer:
         ch = self.node.dial(replica.peer.addr, timeout=min(30.0, self.rpc_timeout))
         ch.sock.settimeout(self.rpc_timeout)
         try:
-            ch.call({"op": "t_open", "model": self.ends.fingerprint, "start": replica.start, "end": replica.end,
-                     "rank": self.rank, "alpha": self.alpha, "targets": self.targets})
+            ask = {"op": "t_open", "model": self.ends.fingerprint, "start": replica.start, "end": replica.end,
+                   "rank": self.rank, "alpha": self.alpha, "targets": self.targets}
+            if self.book is not None:
+                ask.update(run=self.book.run, ticket=self.book.ticket(replica.peer.node_id))
+            if self.team is not None:
+                ask["team"] = self.team
+            ch.call(ask)
             ch.call({"op": "t_adapters"}, blob=self._blob(replica.start, replica.end))
         except BaseException:
             ch.close()
@@ -185,7 +201,8 @@ class Trainer:
     def _able(self) -> list:
         return [p for p in self.node.table.peers()
                 if p.node_id not in self._excluded() and p.addr not in self._excluded()
-                and any(s["model"] == self.ends.fingerprint and s.get("train") for s in p.services)]
+                and any(s["model"] == self.ends.fingerprint and s.get("train")
+                        and (self.team is None or self.team in s.get("teams", ())) for s in p.services)]
 
     def _recruit(self, hop: Hop, count: int) -> List[Hop]:
         taken = [r for r in hop.replicas() if r.ch is not None] or [hop]
@@ -193,6 +210,7 @@ class Trainer:
         used_ips = {_ip(r.peer.addr) for r in taken}
         options = [p for p in self._able() if p.node_id not in used_ids and any(
             s["model"] == self.ends.fingerprint and s.get("train") and s["variant"] == hop.variant
+            and (self.team is None or self.team in s.get("teams", ()))
             and s["layers"][0] <= hop.start and hop.end <= s["layers"][1] for s in p.services)]
         options.sort(key=lambda p: (_ip(p.addr) not in used_ips, random.random()), reverse=True)
         got: List[Hop] = []
@@ -217,7 +235,7 @@ class Trainer:
             wanted = (2 if len(self._able()) >= 3 else 1) if self.redundancy is None else self.redundancy
             try:
                 hops = plan_route(self.node.table.peers(), self.ends.fingerprint, own, total, self._excluded(),
-                                  None, training=True)
+                                  None, training=True, team=self.team)
             except NoRoute as e:
                 if time.time() >= deadline:
                     raise NoRoute(f"{e} (among peers that have agreed to help with training)") from None
@@ -333,6 +351,7 @@ class Trainer:
             g_in = self._settle(i, self._ask(i, "t_bwd", g), False)
             got.update(self._settle(i, self._ask(i, "t_grads", None), True))
             tally.append(len([r for r in self.route[i].replicas() if r.ch is not None]) > 1)
+            self._pending += [r.peer.node_id for r in self.route[i].replicas() if r.ch is not None]
             g = g_in
         got.update(self.ends.train_backward(graph, g[0]))
         for k, v in got.items():
@@ -343,10 +362,15 @@ class Trainer:
 
     def _example(self, ids: List[int], labels: List[int]) -> float:
         for _ in range(self.max_redo):
+            self._pending = []
             try:
                 if not self.route and self.ends.own_layers < self.ends.num_layers:
                     self.route = self._connect()
-                return self._attempt(ids, labels)
+                began = time.time()
+                loss = self._attempt(ids, labels)
+                if self.book is not None:          # only work that went into the result counts as help
+                    self.book.credit(self._pending, (time.time() - began) / max(1, len(self._pending)))
+                return loss
             except _Redo:
                 self._recover()
         raise NoRoute("one training example kept failing; too many peers dropped out or were caught lying")
@@ -475,7 +499,8 @@ class Trainer:
             if made_for and made_for != ends.fingerprint:
                 raise ValueError(f"this adapter was trained on a different model ({made_for}); "
                                  f"the model here is {ends.fingerprint}")
-        t = cls(node, ends, work_dir, total_steps=1, rank=rank, alpha=alpha, targets=targets, **kw)
+        t = cls(node, ends, work_dir, total_steps=1, rank=rank, alpha=alpha, targets=targets,
+                record_helpers=False, **kw)
         head = "base_model.model." + ends.stack.prefix
         loaded = {}
         for key, value in weights.items():
@@ -490,6 +515,29 @@ class Trainer:
         t.adapters = {k: np.array(loaded[k], dtype=f32) for k in t._order}
         return t
 
+    @classmethod
+    def continuing(cls, node, ends: Ends, work_dir: str, adapter_dir: str, **kw) -> "Trainer":
+        """A trainer that starts from a finished adapter, to train it further. See the desktop's SwarmTrainer."""
+        from ..team import adapter_fingerprint, continued, fitted
+        model_dir = os.path.dirname(ends._embed_file.path)
+        found = fitted(adapter_dir, ends.stack.prefix, ends.fingerprint,
+                       lambda targets: all_shapes(model_dir, ends.stack.prefix, targets))
+        for key in ("rank", "alpha", "targets", "init"):
+            kw.pop(key, None)
+        t = cls(node, ends, work_dir, rank=found["rank"], alpha=found["alpha"], targets=found["targets"],
+                init=found["adapters"], **kw)
+        t.history = continued(found["facts"], found["name"], adapter_fingerprint(found["adapters"]))
+        return t
+
+    def record(self) -> dict:
+        """What to add to a finished adapter's facts: its run, how many devices helped, what it stands on."""
+        out: dict = {}
+        if self.book is not None:
+            out.update(run=self.book.run, helpers=len(self.book.helpers))
+        if self.history:
+            out["history"] = self.history
+        return out
+
     def _score_with(self, adapters: Dict[str, np.ndarray], examples: List[Example]):
         from ..scoring import tally
         mine, self.adapters = self.adapters, adapters
@@ -502,6 +550,30 @@ class Trainer:
             return tally(totals[0], totals[1], totals[2]), totals[2], totals[3], totals[4]
         finally:
             self.adapters = mine
+
+    def losses(self, adapters: Dict[str, np.ndarray], examples: List[Example]) -> List[float]:
+        """The loss on each pair's answer, one number per pair, with the given adapters. Forward only."""
+        mine, self.adapters = self.adapters, adapters
+        try:
+            self._push()
+            out = []
+            for ids, labels in examples:
+                loss, _, tokens, _, _ = self._retry(lambda: self._score_once(ids, labels))
+                out.append(loss / max(1, tokens))
+            return out
+        finally:
+            self.adapters = mine
+
+    def flattery(self, examples: List[Example]) -> dict:
+        """The flattery check (see flattery.py), as on a desktop."""
+        from ..flattery import card
+        plain = {k: (np.zeros_like(v) if k.endswith(".B") else v) for k, v in self.adapters.items()}
+        try:
+            if not self.route and self.ends.own_layers < self.ends.num_layers:
+                self.route = self._connect()
+            return card(self.losses(plain, examples), self.losses(self.adapters, examples))
+        finally:
+            self.close()
 
     def compare(self, examples: List[Example], name: str = "", held_out: bool = False) -> dict:
         """A score card: the unchanged model against the model with these adapters, on the same pairs."""
@@ -570,5 +642,7 @@ class Trainer:
                        "peers_blocked": len(self.caught), "rank": self.rank, "alpha": self.alpha, "lr": self.lr,
                        "pairs_kept_back": kept_back, "score": score,
                        "base_model_name": os.path.basename(os.path.normpath(base_model_name or "")),
-                       "trained_from": "a phone or other device without PyTorch"}, f, indent=2)
+                       "trained_from": "a phone or other device without PyTorch", **self.record()}, f, indent=2)
+        if self.book is not None:
+            self.book.copy_to(out_dir)             # lets the devices that helped be offered a copy later
         return out_dir

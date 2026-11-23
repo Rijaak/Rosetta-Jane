@@ -100,17 +100,35 @@ def cmd_serve(args) -> int:
     server = LayerServer(args.model, start, end, args.work_dir, max_sessions=args.max_sessions,
                          training=args.training, **_load_kwargs(args))
     server.attach(node)
+    from .helpers import Sharing
+    from .team import TeamService
+    sharing = Sharing(node, server.helped).attach()
+    teams = TeamService(node, server, codes=args.team, any_open=args.team_open, any_invited=args.team_invited,
+                        say=lambda text: print(text, flush=True))
     print(f"{NAME}: serving layers {start}-{end - 1} of model {server.fingerprint} on port {node.port}. "
           + ("Also helping with training. " if args.training else "") + "Ctrl-C to stop.")
     try:
+        ticks, told = 0, set()
         while True:
-            time.sleep(60)
-            print(f"  peers known: {len(node.table.peers())}   answers helped: {server.steps_served} steps, "
-                  f"{server.tokens_served} tokens   training examples helped: {server.examples_trained}",
-                  flush=True)
+            time.sleep(5)
+            ticks += 1
+            teams.tick()
+            for offer in sharing.offers():
+                if offer["run"] not in told:
+                    told.add(offer["run"])
+                    print(f"  An adapter this device helped train ({offer['examples']} pieces of work) is being "
+                          f"shared with its helpers. To look, or take a copy, run in another terminal:\n"
+                          f"    rosetta_jane shared --model {args.model} --work-dir {args.work_dir} "
+                          f"--group-code ...   (add --take {offer['run']} to take it)", flush=True)
+            if ticks % 12 == 0:
+                print(f"  peers known: {len(node.table.peers())}   answers helped: {server.steps_served} steps, "
+                      f"{server.tokens_served} tokens   training examples helped: {server.examples_trained}"
+                      + (f"   teams: {len(teams.links)}" if teams.links else ""), flush=True)
     except KeyboardInterrupt:
         print("stopping")
     finally:
+        teams.leave_all()
+        server.helped.save()
         node.stop()
     return 0
 
@@ -353,6 +371,7 @@ def cmd_train(args) -> int:
     from .train import SwarmTrainer
     pairs = read_pairs(args.data)
     node, ends, tokenizer, auditor, canaries, redundancy = _checking(args)
+    link = None
     try:
         from .scoring import describe, split_holdout
         examples, cut = tokenize_pairs(pairs, tokenizer, args.max_tokens)
@@ -365,16 +384,36 @@ def cmd_train(args) -> int:
               f"Your device keeps layers 0-{args.own_layers - 1}, the output layer and every trained weight. "
               "Peers that help can see the hidden states for your text and the trained weights for their own "
               "layers.")
-        trainer = SwarmTrainer(node, ends, args.model, args.work_dir, total_steps=steps, accum=args.accum,
-                               lr=args.lr, warmup_steps=args.warmup_steps, rank=args.rank, alpha=args.alpha,
-                               targets=args.targets.split(","), seed=args.seed, data_seed=args.seed,
-                               save_every=args.save_every, run_id=args.run_id, redundancy=redundancy,
-                               tolerance=args.tolerance, auditor=auditor,
-                               audit_rate=args.audit_rate if args.audit else 0.0, canaries=canaries,
-                               canary_rate=args.known_answer_rate, variant=args.variant)
+        common = dict(total_steps=steps, accum=args.accum, lr=args.lr, warmup_steps=args.warmup_steps,
+                      seed=args.seed, data_seed=args.seed, save_every=args.save_every, run_id=args.run_id,
+                      redundancy=redundancy, tolerance=args.tolerance, auditor=auditor,
+                      audit_rate=args.audit_rate if args.audit else 0.0, canaries=canaries,
+                      canary_rate=args.known_answer_rate, variant=args.variant)
+        if args.team:                              # train inside a team: only its signed-on devices do the work
+            from .team import NoTeam, TeamLink
+            try:
+                link = TeamLink(node, model=ends.fingerprint, code=args.team, want=[[0, args.own_layers]]).join()
+            except (NoTeam, PermissionError) as e:
+                raise ValueError(f"team {args.team}: {e}") from None
+            if link.kind != "teaching":
+                raise ValueError(f"team {args.team} is for sessions. Training together happens in a teaching "
+                                 "team: `rosetta_jane team lead --teaching`.")
+            common["team"] = link.id
+            print("Training inside the teaching team: only devices signed on to it, and helping with training, "
+                  "do the work.")
+        if args.from_adapter:                      # carry an adapter further instead of starting from nothing
+            trainer = SwarmTrainer.continuing(node, ends, args.model, args.work_dir, args.from_adapter, **common)
+            print(f"Continuing from the adapter in {args.from_adapter} (rank {trainer.rank}, alpha "
+                  f"{trainer.alpha:g}; its own settings are kept). It is not changed; the result is a new adapter.")
+        else:
+            trainer = SwarmTrainer(node, ends, args.model, args.work_dir, rank=args.rank, alpha=args.alpha,
+                                   targets=args.targets.split(","), **common)
         node.refresh(3)
         stats = trainer.train(examples)
         score = trainer.compare(held, name=os.path.basename(os.path.normpath(args.out)), held_out=True) if held else None
+        from .control import flattery_examples
+        from .flattery import describe as describe_flattery
+        flattery = trainer.flattery(flattery_examples(tokenizer, args.max_tokens))
         out = trainer.export(args.out, args.base_model_name or os.path.abspath(args.model))
         with open(os.path.join(out, "rosetta-jane-run.json"), "w") as f:
             json.dump({"name": os.path.basename(os.path.normpath(args.out)), "base_model_fingerprint": ends.fingerprint,
@@ -382,8 +421,13 @@ def cmd_train(args) -> int:
                        "base_model_name": os.path.basename(os.path.normpath(args.model)),
                        "pairs_kept_back": len(held), "steps": stats["steps"], "final_loss": stats["final_loss"],
                        "work_checked": stats["checked_examples"], "work_unchecked": stats["unchecked_examples"],
-                       "peers_blocked": stats["peers_blocked"], "score": score}, f, indent=2)
-        print("\n".join(describe(score)))
+                       "peers_blocked": stats["peers_blocked"], "score": score, "flattery": flattery,
+                       **trainer.record()}, f, indent=2)
+        print("\n".join(describe(score) + describe_flattery(flattery)))
+        helpers = trainer.record().get("helpers", 0)
+        if helpers:
+            print(f"{helpers} other device{'s' if helpers != 1 else ''} did work on this adapter. Whether they get "
+                  f"a copy is your choice. To offer it: rosetta_jane share --adapter {out} --group-code ...")
         print(f"done: {stats['steps']} steps, final loss {stats['final_loss']:.4f}. "
               f"{stats['checked_examples']} checked and {stats['unchecked_examples']} unchecked pieces of work, "
               f"{stats['peers_blocked']} peers blocked, {stats['redone']} examples redone.\n"
@@ -393,6 +437,8 @@ def cmd_train(args) -> int:
     except ValueError as e:
         raise SystemExit(str(e))
     finally:
+        if link is not None:
+            link.leave()
         node.stop()
     return 0
 
@@ -438,6 +484,27 @@ def cmd_score(args) -> int:
     return 0
 
 
+def cmd_flattery(args) -> int:
+    """Measure whether an adapter goes along with false statements more than the unchanged model does."""
+    from .control import flattery_examples, save_fact
+    from .flattery import describe
+    from .swarm import NoRoute
+    node, ends, tokenizer, trainer, name = _with_adapter(args)
+    try:
+        result = trainer.flattery(flattery_examples(tokenizer, args.max_tokens))
+        print("\n".join(describe(result)))
+        try:
+            save_fact(args.adapter, "flattery", result)
+            print("Kept with the adapter, so it is shown to people before they join a team that uses it.")
+        except OSError:
+            pass
+    except NoRoute as e:
+        raise SystemExit(f"the check stopped: {e}")
+    finally:
+        node.stop()
+    return 0
+
+
 def cmd_scores(args) -> int:
     """Write the Model Adapter Score document: every score held on this device, side by side."""
     from .scorebook import TITLE, build, collect
@@ -477,6 +544,367 @@ def cmd_try(args) -> int:
     return 0
 
 
+# -- teams: an adapter applied for a group because its members signed on ------------------------------
+def _team_session(node, gateway, args) -> int:
+    """The terminal's team screen: a few commands, and everything else is a question for the model."""
+    import threading
+
+    from .swarm import NoRoute
+    from .team import JOINING_WORDS
+    leading = gateway.team.role == "leader"
+    done = threading.Event()
+
+    def watch():                                   # say so when the team begins, grows or ends
+        seen = None
+        while not done.wait(1.0):
+            t = gateway.team
+            now = (t.begun, t.ended, len(t.roster()) if leading else t.members)
+            for r in t.requests() if leading and t.ended is None else []:
+                if r["id"] not in told:
+                    told.add(r["id"])
+                    print(f"\n[team] A device at {r['who']} asks to join. Type: approve {r['id']}   or   "
+                          f"decline {r['id']}", flush=True)
+            if seen is not None and now != seen:
+                if now[1] is not None:
+                    print(f"\n[team] The team is over: {now[1]}. Answers are from the unchanged model again. "
+                          + ("Type rate to answer a few questions about the adapter, or press Enter to finish."
+                             if rates and t.rated is None else "Press Enter to finish."), flush=True)
+                    return
+                if now[0] != seen[0] and now[0]:
+                    print(f"\n[team] Begun. Answers now come from the model with \"{t.name}\".", flush=True)
+                if now[2] != seen[2]:
+                    print(f"\n[team] {now[2]} device{'s' if now[2] != 1 else ''} in the team.", flush=True)
+            seen = now
+    threading.Thread(target=watch, daemon=True).start()
+    teaching = gateway.team.kind == "teaching"
+    rates = not leading and not teaching and gateway.team.desc.get("adapter") is not None
+    print("Commands: " + (("" if teaching else "begin, ") + "who, devices, invite ADDRESS, requests, approve N, "
+                          "decline N, remove N, open | ask | invisible (who can sign on), end. "
+                          if leading else "who, " + ("rate (answer a few questions about the adapter), blind [QUESTION] "
+                                              "(two unlabelled answers; you say which was right), " if rates else "")
+                          + "leave. ")
+          + ("A teaching team does not query: this device asks no questions until it leaves." if teaching else
+             "Anything else is a question.")
+          + ("" if leading or teaching else "\nTeaching points with this leader: type points to see them, "
+             "boost N to spend N (each is 1% more of the team's computing power, for an hour)."))
+    told = set()
+    try:
+        for line in sys.stdin:
+            text = line.strip()
+            t = gateway.team
+            word, _, rest = text.partition(" ")
+            try:
+                if rates and word == "rate":       # the community rating; still possible just after the team ends
+                    _ask_marks(gateway)
+                    if t.ended is not None:
+                        break
+                    continue
+                if rates and word == "blind" and t.ended is None:
+                    got = gateway.blind({"messages": [{"role": "user", "content": rest.strip()}]}
+                                        if rest.strip() else {})["blind"]
+                    print(f"Question: {got['question']}\nAnswer A:\n  {got['a']}\nAnswer B:\n  {got['b']}\n"
+                          "One of these is the adapter's and one is the unchanged model's. Which was right? "
+                          "Type a, b, both or neither.", flush=True)
+                    shown = gateway.team_control("pick", {"id": got["id"],
+                                                          "choice": sys.stdin.readline().strip().lower()})["revealed"]
+                    print(f"Answer {shown['adapter_was'].upper()} was the adapter's. Your answer joins its "
+                          "community rating.")
+                    continue
+                if t.ended is not None:
+                    break
+                if not text:
+                    continue
+                if not leading and (text == "points" or word == "boost"):
+                    got = gateway.team_control("points" if text == "points" else "boost",
+                                               {"points": int(rest) if rest.strip().isdigit() else 0})["points"]
+                    print(f"Teaching points with this leader: {got['balance']}. "
+                          + (f"In force now: {got['boost']} (your share of the team's computing power is "
+                             f"{100 + got['boost']} to everyone else's 100), for {got['minutes']} more minutes."
+                             if got["boost"] else "None in force."))
+                    continue
+                if text in ("end", "leave", "quit", "exit"):
+                    if rates and t.rated is None:
+                        print("Before you go, a few questions about the adapter.")
+                        _ask_marks(gateway)
+                    break
+                if text == "who":
+                    r = gateway.team_report()
+                    print(f"Team {r['code'] or r['team']}: adapter \"{r['name']}\", "
+                          f"{'begun' if r['begun'] else 'not begun'}, {JOINING_WORDS.get(r['joining'], '')}.")
+                    for card in r.get("roster", []):
+                        role = ", ".join(x for x in ("asks" if card["asks"] else "",
+                                                     f"serves layers {card['serves'][0]}-{card['serves'][1] - 1}"
+                                                     if card["serves"] else "") if x)
+                        print(f"  {card['who']}: {card['state']}" + (f" ({role})" if role else "")
+                              + (f"   +{card['boost']}% share" if card.get("boost") else "")
+                              + (f"   [remove {card['id']}]" if card.get("id") else ""))
+                    for q in r.get("requests", []):
+                        print(f"  Asking to join: a device at {q['who']}   [approve {q['id']} / decline {q['id']}]")
+                    if not leading:
+                        print(f"  {r['members']} devices in the team.")
+                    if r.get("missing"):
+                        print(f"  No signed-on device serves layers {r['missing']} yet.")
+                    elif r.get("missing_for_you"):
+                        print(f"  For your own questions, another device has to sign on for layers "
+                              f"{r['missing_for_you']}: a device does not route through the layers it serves itself.")
+                elif leading and word == "begin":
+                    gateway.team_control("begin", {"force": rest.strip() == "anyway"})
+                elif leading and text in ("open", "ask", "invisible"):
+                    gateway.team_control("settings", {"joining": text})
+                    print(f"Who can sign on: {JOINING_WORDS[text]}. Remembered for your next team.")
+                elif leading and text == "requests":
+                    waiting = gateway.team_report()["requests"]
+                    print("\n".join(f"  a device at {q['who']}: approve {q['id']} / decline {q['id']}"
+                                    for q in waiting) or "  Nobody is asking to join.")
+                elif leading and word in ("approve", "decline"):
+                    gateway.team_control(word, {"request": rest.strip()})
+                    print("Approved: it is signed on and supplied with the adapter at its next check."
+                          if word == "approve" else "Declined.")
+                elif leading and word == "remove":
+                    gateway.team_control("remove", {"member": rest.strip()})
+                    print("Removed. It drops the adapter at its next check and cannot rejoin this team.")
+                elif leading and word == "invite":
+                    gateway.team_control("invite", {"addr": rest.strip()})
+                    print(f"Invited {rest.strip()}. Its owner decides.")
+                elif leading and text == "devices":
+                    for d in gateway.team_control("devices", {})["devices"]:
+                        what = f"serves layers {d['serves'][0]}-{d['serves'][1] - 1}" if d["serves"] else "not serving"
+                        print(f"  {d['addr']:<24} {(d['name'] or '-'):<16} {what}" + ("  in the team" if d["in_team"] else
+                                                               "  invited" if d["invited"] else
+                                                               "  in another team" if d["busy"] else ""))
+                else:
+                    ids = gateway.chat_ids([{"role": "user", "content": text}])
+                    final = gateway.answer(ids, {"temperature": args.temperature},
+                                           lambda piece: print(piece, end="", flush=True))
+                    how = "unchanged model: the team has not begun" if not final["team"] else \
+                        "unchanged model, on the team's devices" if t.use().plain else \
+                        ('with the adapter "' + t.name + '"')
+                    print(f"\n[{how}, through {final['peers_used']} peers, {final['checked_steps']} checked and "
+                          f"{final['unchecked_steps']} unchecked steps]")
+            except NoRoute as e:
+                print(f"The team cannot answer right now: {e}")
+            except ValueError as e:
+                print(str(e))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        done.set()
+        gateway.leave_team()
+        if leading:
+            gateway.team.settle()                  # let the members hear it before this program goes
+        if gateway.service is not None:
+            gateway.service.helped.save()
+        node.stop()
+    print("Team ended. Nothing stays applied." if leading else "Left the team. Nothing stays applied.")
+    return 0
+
+
+def _ask_marks(gateway) -> None:
+    """Put the community rating's questions to the person, one at a time. Each can be skipped."""
+    from .team import QUESTIONS
+    given = {}
+    for key, question in QUESTIONS.items():
+        print(f"{question} Type a mark from 1 (rarely) to 5 (nearly always) and press Enter, or just press "
+              "Enter to skip.", flush=True)
+        mark = sys.stdin.readline().strip()
+        if mark.isdigit():
+            given[key] = int(mark)
+    if not given:
+        print("No marks given.")
+        return
+    try:
+        gateway.team_control("rate", {"marks": given})
+        print(f"Thank you. Your {len(given)} mark{'s' if len(given) != 1 else ''} join the adapter's community "
+              "rating, apart from its teacher rating.")
+    except ValueError as e:
+        print(str(e))
+
+
+def cmd_team_lead(args) -> int:
+    """Lead a team with an adapter you hold. Others sign on; you begin; answers then use the adapter."""
+    from .team import JOINING_WORDS, fact_lines
+    node, gateway = _gateway(args)
+    try:
+        node.refresh(3)
+        if args.invisible_device:
+            gateway.desk.hidden = gateway.desk.invitations.closed = True     # for this run only
+        if args.called is not None:
+            gateway.team_control("settings", {"name": args.called})
+        if args.teaching and args.adapter:
+            raise ValueError("a teaching team is not led with an adapter. To train an adapter further, start "
+                             "the run with `train --team CODE --from-adapter FOLDER`.")
+        host = gateway.desk.lead(args.adapter, os.path.basename(os.path.normpath(args.adapter)) if args.adapter
+                                 else None, args.joining, args.limit, kind="teaching" if args.teaching else "session")
+    except ValueError as e:
+        node.stop()
+        raise SystemExit(str(e))
+    print(f"{NAME}: you are leading a team "
+          + ("for teaching: its devices work together on training an adapter.\n"
+             "  To train, from another terminal: rosetta_jane train ... --team \"" + host.code + "\"\n"
+             "  When the run is done, offering the adapter to the devices that helped is your choice "
+             "(rosetta_jane share).\n" if host.kind == "teaching" else
+             f"with the adapter \"{host.name}\".\n" if not host.plain else
+             "with no adapter: it pools its devices to run the unchanged model.\n") + ""
+          f"  Team code: {host.code}\n  Who can sign on: {JOINING_WORDS[host.joining]}.\n"
+          f"  This device is at port {node.port}.\n"
+          "What people are shown before they sign on:\n    " + "\n    ".join(fact_lines(host.describe())) + "\n"
+          "Devices that serve layers must sign on too."
+          + ("" if host.kind == "teaching" else " Type 'begin' once the layers are covered."))
+    return _team_session(node, gateway, args)
+
+
+def cmd_team_join(args) -> int:
+    """Sign on to a team: by its code, by waiting for an invitation, or the first open team for your model."""
+    from .team import NoTeam, teams_in_group
+    node, gateway = _gateway(args)
+    try:
+        node.refresh(3)
+        if args.code:
+            req = {"code": args.code}
+        elif args.invited:
+            print(f"Waiting for an invitation. This device is at port {node.port}; the leader's 'devices' "
+                  "list shows its address.")
+            deadline, found = time.time() + args.invited * 60, []
+            while not found and time.time() < deadline:
+                time.sleep(1.0)
+                found = gateway.invitations.list(gateway.ends.fingerprint)
+            if not found:
+                raise SystemExit("no invitation arrived")
+            req = {"team": found[0]["team"]}
+        else:                                      # the first team listed for this model: open ones first
+            found = teams_in_group(node, gateway.ends.fingerprint)
+            if not found:
+                raise SystemExit("no team for this model is listed in the group right now. Give a team code, "
+                                 "or lead a team yourself with `rosetta_jane team lead`.")
+            req = {"team": found[0]["team"]}
+        if args.invisible_device:
+            gateway.desk.hidden = gateway.desk.invitations.closed = True     # for this run only
+        if args.called is not None:
+            gateway.team_control("settings", {"name": args.called})
+        look = gateway.look_team(req)
+        print("Before you sign on:\n  " + "\n  ".join(look["lines"]))
+        if not look["fits"]:
+            raise SystemExit("That team is for a different model than the one on this device.")
+        asks = look["joining"] == "ask" and "code" not in req and not args.invited
+        if not args.yes:
+            print(("Ask this team's leader to let this device in? If they approve, it is signed on and supplied "
+                   "with the adapter at once. " if asks else "Sign this device on? ")
+                  + "Answers then come from this team, once the leader begins, until you leave. "
+                  "Type y and press Enter; anything else does not.", flush=True)
+            if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+                raise SystemExit("Not signed on. Nothing was applied.")
+        gateway.join_team(req)
+        if gateway.team is None or gateway.team.ended is not None:      # a request: wait for the leader
+            print("Asked. Waiting for the leader to approve.", flush=True)
+            while gateway.desk.pending is not None and gateway.desk.pending["state"] == "waiting":
+                time.sleep(0.5)
+            if gateway.desk.pending is not None:
+                raise SystemExit(f"Not signed on: {gateway.desk.pending['state']}.")
+    except (ValueError, NoTeam, PermissionError) as e:
+        node.stop()
+        raise SystemExit(str(e))
+    except SystemExit:
+        node.stop()
+        raise
+    print(f"Signed on. {'The team has begun.' if gateway.team.begun else 'Waiting for the leader to begin.'}")
+    return _team_session(node, gateway, args)
+
+
+def cmd_teams(args) -> int:
+    """List the teams anyone in this group can see: open ones, and ones that take an invitation."""
+    from .team import JOINING_WORDS, teams_in_group
+    node = _node(args, quiet=True).start()
+    try:
+        node.refresh(args.rounds)
+        found = teams_in_group(node)
+        print(f"{len(found)} team{'s' if len(found) != 1 else ''} visible in this group "
+              "(invisible teams are not listed; they take their code or an invitation)")
+        for lobby, title in (("session", "Teams running sessions (querying the model):"),
+                             ("teaching", "Teaching teams (training an adapter):")):
+            if any(t["kind"] == lobby for t in found):
+                print(title)
+            for t in (t for t in found if t["kind"] == lobby):
+                _print_team(t, JOINING_WORDS)
+    finally:
+        node.stop()
+    return 0
+
+
+def _print_team(t: dict, words: dict) -> None:
+    facts = t["facts"]
+    community = facts.get("community") or {}
+    print(f"  Model {(t['model_name'] or '') + ' '}({t['model']}). "
+          + (f"Adapter \"{t['name']}\" ({t['adapter']})." if t["adapter"] else "No adapter.") + "\n"
+          f"      {t['members']}/{t['limit']} devices, {'begun' if t['begun'] else 'gathering'}, "
+          f"{words[t['joining']]}."
+          + ("" if not t["adapter"] else
+             f"\n      training work checked {facts.get('work_checked', 'unknown')}, "
+             f"unchecked {facts.get('work_unchecked', 'unknown')}"
+             f"\n      teacher rating: {(facts.get('score') or {}).get('verdict', 'not scored')}; "
+             "community rating: " + (f"{community['average']} out of 5 from {community['ratings']}"
+                                     if community.get("ratings", 0) >= 5 else
+                                     f"{community['ratings']} marks, too few to rely on"
+                                     if community.get("ratings") else "none yet")))
+
+
+def cmd_share(args) -> int:
+    """Offer a finished adapter to the devices that helped train it, for as long as this runs."""
+    from .helpers import Sharing
+    node = _node(args, quiet=True).start()
+    try:
+        model = "0" * 16
+        if args.model:
+            from .layers import model_fingerprint
+            model = model_fingerprint(args.model)
+        sharing = Sharing(node).attach()
+        row = sharing.open(args.adapter, model)
+        print(f"{NAME}: offering \"{row['name']}\" to the {row['helpers']} device"
+              f"{'s' if row['helpers'] != 1 else ''} whose work went into it. Each owner decides whether to take "
+              "a copy. Their own model stays unchanged either way. Ctrl-C to stop offering.")
+        taken = 0
+        while True:
+            time.sleep(2)
+            now = sharing.report()[0]["taken"]
+            if now != taken:
+                taken = now
+                print(f"  {taken} of {row['helpers']} have taken a copy.", flush=True)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    except KeyboardInterrupt:
+        print("stopped offering")
+    finally:
+        node.stop()
+    return 0
+
+
+def cmd_shared(args) -> int:
+    """See the adapters this device helped train that are on offer, and take a copy of one."""
+    from .helpers import HelpLog, Sharing
+    from .layers import model_fingerprint
+    from .team import fact_lines
+    node = _node(args, quiet=True).start()
+    try:
+        sharing = Sharing(node, HelpLog(os.path.join(args.work_dir, "helped.json")))
+        node.refresh(args.rounds)
+        offers = sharing.offers()
+        if args.take:
+            kept = sharing.take(args.take, args.work_dir, model_fingerprint(args.model), args.name)
+            print(f"Stored as \"{kept}\" in {os.path.join(args.work_dir, 'adapters', kept)}. Nothing has been "
+                  "applied. You can try it, score it, lead a team with it, or train it further.")
+            return 0
+        print(f"{len(offers)} adapter{'s' if len(offers) != 1 else ''} this device helped train "
+              f"{'is' if len(offers) == 1 else 'are'} on offer right now.")
+        for offer in offers:
+            found = sharing.look(offer["run"])
+            print(f"  run {offer['run']}: \"{found['name']}\", {offer['examples']} pieces of work done here.\n    "
+                  + "\n    ".join(fact_lines(found)[1:]) + f"\n    To take a copy: add --take {offer['run']}")
+    except (KeyError, PermissionError, ValueError) as e:
+        raise SystemExit(str(e.args[0]) if e.args else str(e))
+    finally:
+        node.stop()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rosetta_jane", formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -487,6 +915,12 @@ def build_parser() -> argparse.ArgumentParser:
                "  lan plan     across PCs you own: decide which PC holds which layers\n"
                "  lan worker   across PCs you own: run on each helping PC\n"
                "  lan train    across PCs you own: run on the PC that holds the training text\n"
+               "teams (pool devices to ask with an adapter or with none, or to teach):\n"
+               "  team lead    lead a team; people and devices sign on. --teaching for a teaching team\n"
+               "  team join    sign on to a team (by code, by invitation, by request, or any open team)\n"
+               "  teams        list the teams visible in your group, in both lobbies\n"
+               "  share        offer a finished adapter to the devices that helped train it\n"
+               "  shared       see what is on offer to this device, and take a copy\n"
                "Every command takes --help.")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -501,6 +935,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-sessions", type=int, default=4, help="answers this device helps with at once")
     s.add_argument("--training", action="store_true",
                    help="also help other people train (heavier work than answering; off unless you say so)")
+    s.add_argument("--team", action="append", default=[], metavar="CODE",
+                   help="sign this device on to the team with this code, so it applies that team's adapter "
+                        "for that team's work; repeat for more teams")
+    s.add_argument("--team-open", action="store_true",
+                   help="sign this device on to any open team for its model (off unless you say so)")
+    s.add_argument("--team-invited", action="store_true",
+                   help="say yes in advance: sign this device on to any team whose leader invites it, and let "
+                        "leaders see it in their lists of devices to invite (off unless you say so)")
     _net_args(s, "0.0.0.0:7700")
     s.set_defaults(fn=cmd_serve)
 
@@ -571,7 +1013,69 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run-id", default="run", help="name of this run; the same name carries on a stopped run")
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--base-model-name", default=None, help="model name to record in the adapter")
+    s.add_argument("--team", default=None, metavar="CODE",
+                   help="train inside the team with this code: only devices signed on to it do the work")
+    s.add_argument("--from-adapter", default=None, metavar="FOLDER",
+                   help="carry on from a finished adapter (yours, or one shared with you) instead of starting "
+                        "from nothing; the result is a new adapter and the old one is kept")
     s.set_defaults(fn=cmd_train)
+
+    def serve_too(s):
+        s.add_argument("--serve", default=None, metavar="FIRST:END",
+                       help="also serve layers from this same program (8:16, or 'auto'); they sign on with it")
+        s.add_argument("--serve-span", type=int, default=8)
+        s.add_argument("--serve-training", action="store_true")
+        s.add_argument("--temperature", type=float, default=0.7)
+        s.add_argument("--invisible-device", action="store_true",
+                       help="keep this device out of leaders' lists of devices to invite")
+        s.add_argument("--called", default=None, metavar="NAME",
+                       help="the name you go by on team screens (a label; nothing checks it). Remembered.")
+
+    team = sub.add_parser("team", help="pool devices as a team, to ask with an adapter or with none, or to teach: "
+                                        "`team lead`, `team join`")
+    tsub = team.add_subparsers(dest="team_command", required=True)
+    s = tsub.add_parser("lead", help="lead a team: with an adapter you hold, with none, or (--teaching) for training")
+    ask_side(s)
+    serve_too(s)
+    s.add_argument("--adapter", default=None,
+                   help="folder holding the adapter. Leave out for a team with no adapter, which pools its "
+                        "devices' computing power to run the unchanged model")
+    s.add_argument("--joining", choices=["open", "ask", "invisible"], default=None,
+                   help="who can sign on: open (anyone in the group), ask (anyone can ask; you approve), "
+                        "invisible (not listed; code or invitation only). Default: what you chose last time, "
+                        "or open.")
+    s.add_argument("--limit", type=int, default=None, help="most devices in the team")
+    s.add_argument("--teaching", action="store_true",
+                   help="lead a teaching team, for training an adapter together. It is listed in its own lobby, "
+                        "apart from teams that query the model")
+    s.set_defaults(fn=cmd_team_lead)
+    s = tsub.add_parser("join", help="sign on to a team")
+    ask_side(s)
+    serve_too(s)
+    s.add_argument("code", nargs="?", default=None, help="the team's code; leave out to take the first open team")
+    s.add_argument("--invited", type=float, default=0, metavar="MINUTES",
+                   help="wait this long for an invitation from a leader instead")
+    s.add_argument("--yes", action="store_true", help="sign on without being asked (you have read the facts)")
+    s.set_defaults(fn=cmd_team_join)
+
+    s = sub.add_parser("teams", help="list the teams visible in your group")
+    _net_args(s, "0.0.0.0:0")
+    s.add_argument("--rounds", type=int, default=4)
+    s.set_defaults(fn=cmd_teams)
+
+    s = sub.add_parser("share", help="offer a finished adapter to the devices that helped train it")
+    s.add_argument("--adapter", required=True, help="folder holding the adapter you trained")
+    s.add_argument("--model", default=None, help="the base model folder (only needed for adapters with no record)")
+    _net_args(s, "0.0.0.0:0")
+    s.set_defaults(fn=cmd_share)
+
+    s = sub.add_parser("shared", help="adapters this device helped train that are on offer; take a copy")
+    s.add_argument("--model", required=True, help="the base model folder on this device")
+    s.add_argument("--take", default=None, metavar="RUN", help="take a copy of the adapter from this run")
+    s.add_argument("--name", default=None, help="name to store it under")
+    s.add_argument("--rounds", type=int, default=4)
+    _net_args(s, "0.0.0.0:0")
+    s.set_defaults(fn=cmd_shared)
 
     s = sub.add_parser("score", help="score an adapter on your own questions: the model with it against "
                                      "the model without it")
@@ -580,6 +1084,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--data", required=True, help="JSONL file of question/answer pairs the adapter was not trained on")
     s.add_argument("--max-tokens", type=int, default=1024)
     s.set_defaults(fn=cmd_score)
+
+    s = sub.add_parser("flattery", help="measure whether an adapter goes along with false statements more than "
+                                        "the unchanged model does")
+    ask_side(s)
+    s.add_argument("--adapter", required=True, help="folder holding the adapter")
+    s.add_argument("--max-tokens", type=int, default=1024)
+    s.set_defaults(fn=cmd_flattery)
 
     s = sub.add_parser("scores", help="write the Model Adapter Score document: every score on this device, "
                                       "side by side, best first")

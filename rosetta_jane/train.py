@@ -64,14 +64,25 @@ class SwarmTrainer:
                  auditor: Optional[LocalAuditor] = None, audit_rate: float = 0.0,
                  canaries=None, canary_rate: float = 0.2, variant: Optional[str] = None,
                  find_wait: float = 15.0, rpc_timeout: float = 300.0, loss_scale: float = 1.0,
-                 max_redo: int = 8, quiet: bool = False, lock=None):
+                 max_redo: int = 8, quiet: bool = False, lock=None,
+                 init: Optional[Dict[str, torch.Tensor]] = None, record_helpers: bool = True,
+                 team: Optional[str] = None):
         self.node, self.ends = node, ends
+        self.team = team                          # train inside a team: only its signed-on devices do the work
         self.rank, self.alpha, self.targets = check_spec(rank, alpha, list(targets))
         self.scale = self.alpha / self.rank
         self.layer_prefix, self.num_layers = model_shape(model_dir)
         self.shapes = shapes_from_files(model_dir, self.targets)
         self.adapters = {k: v.requires_grad_(True) for k, v in init_adapters(self.shapes, self.rank, seed).items()}
         self._order = sorted(self.adapters)
+        if init is not None:                      # carry on from a finished adapter instead of from nothing
+            if sorted(init) != self._order or any(tuple(init[k].shape) != tuple(self.adapters[k].shape)
+                                                  or not torch.isfinite(init[k]).all() for k in init):
+                raise ValueError("the adapter to start from does not fit this model")
+            with torch.no_grad():
+                for k in self._order:
+                    self.adapters[k].copy_(init[k])
+        self.history: List[dict] = []             # the adapters this run stands on, oldest first
         self.opt = torch.optim.AdamW([self.adapters[k] for k in self._order], lr=0.0, weight_decay=0.0)
         self._acc = {k: torch.zeros_like(v) for k, v in self.adapters.items()}
         self.total_steps, self.accum, self.lr = total_steps, accum, lr
@@ -79,6 +90,11 @@ class SwarmTrainer:
         self.data_seed, self.save_every, self.keep = data_seed, save_every, keep_checkpoints
         self.dir = os.path.join(work_dir, f"train-{run_id}")
         os.makedirs(self.dir, exist_ok=True)
+        # Who helped: each helping device gets a ticket, and its accepted work is counted, so the
+        # finished adapter can be shared with the devices that worked on it (see helpers.py).
+        from .helpers import RunBook
+        self.book = RunBook(self.dir) if record_helpers else None
+        self._pending: List[str] = []
         self.redundancy, self.tolerance = redundancy, tolerance
         self.auditor, self.audit_rate = auditor, (audit_rate if auditor is not None else 0.0)
         self.canaries, self.canary_rate = canaries, canary_rate
@@ -125,6 +141,8 @@ class SwarmTrainer:
         os.replace(tmp, final)
         for old in self.checkpoints()[:-self.keep]:
             shutil.rmtree(self._ckpt(old), ignore_errors=True)
+        if self.book is not None:
+            self.book.save()
 
     def resume(self) -> bool:
         have = self.checkpoints()
@@ -173,8 +191,13 @@ class SwarmTrainer:
         ch = self.node.dial(peer.addr, timeout=min(30.0, self.rpc_timeout))
         ch.sock.settimeout(self.rpc_timeout)
         try:
-            ch.call({"op": "t_open", "model": self.ends.fingerprint, "start": replica.start, "end": replica.end,
-                     "rank": self.rank, "alpha": self.alpha, "targets": self.targets})
+            ask = {"op": "t_open", "model": self.ends.fingerprint, "start": replica.start, "end": replica.end,
+                   "rank": self.rank, "alpha": self.alpha, "targets": self.targets}
+            if self.book is not None:
+                ask.update(run=self.book.run, ticket=self.book.ticket(peer.node_id))
+            if self.team is not None:
+                ask["team"] = self.team
+            ch.call(ask)
             ch.call({"op": "t_adapters"}, blob=self._blob(replica.start, replica.end))
         except BaseException:
             ch.close()
@@ -185,6 +208,7 @@ class SwarmTrainer:
         return [p for p in self.node.table.peers()
                 if p.node_id not in self._excluded() and p.addr not in self._excluded()
                 and any(s["model"] == self.ends.fingerprint and s.get("train")
+                        and (self.team is None or self.team in s.get("teams", ()))
                         and (self.variant is None or s["variant"] == self.variant) for s in p.services)]
 
     def _recruit(self, hop: Hop, count: int) -> List[Hop]:
@@ -197,6 +221,7 @@ class SwarmTrainer:
                 continue
             for s in p.services:
                 if s["model"] == self.ends.fingerprint and s.get("train") and s["variant"] == hop.variant \
+                        and (self.team is None or self.team in s.get("teams", ())) \
                         and s["layers"][0] <= hop.start and hop.end <= s["layers"][1]:
                     options.append((p, s))
                     break
@@ -226,7 +251,7 @@ class SwarmTrainer:
                 wanted = self.redundancy
             try:
                 hops = plan_route(self.node.table.peers(), self.ends.fingerprint, own, total,
-                                  self._excluded(), self.variant, training=True)
+                                  self._excluded(), self.variant, training=True, team=self.team)
             except NoRoute as e:
                 if time.time() >= deadline:
                     raise NoRoute(f"{e} (among peers that have agreed to help with training)") from None
@@ -420,6 +445,7 @@ class SwarmTrainer:
                 self.verified_examples += 1
             else:
                 self.unverified_examples += 1
+            self._pending += [r.peer.node_id for r in self.route[i].replicas() if r.ch is not None]
             got.update(grads)
             g = g_in
         h0.backward(g.to(h0.device, h0.dtype))
@@ -438,10 +464,15 @@ class SwarmTrainer:
     def _one(self, ids: torch.Tensor, labels: torch.Tensor) -> float:
         for _ in range(self.max_redo):
             before = (self.verified_examples, self.unverified_examples)
+            self._pending = []
             try:
                 if not self.route and self.ends.own_layers < self.num_layers:
                     self.route = self._connect()
-                return self._attempt(ids, labels)
+                began = time.time()
+                loss = self._attempt(ids, labels)
+                if self.book is not None:         # only work that went into the result counts as help
+                    self.book.credit(self._pending, (time.time() - began) / max(1, len(self._pending)))
+                return loss
             except _Redo:
                 self.verified_examples, self.unverified_examples = before
                 self._recover()
@@ -611,7 +642,8 @@ class SwarmTrainer:
             if made_for and made_for != ends.fingerprint:
                 raise ValueError(f"this adapter was trained on a different model ({made_for}); "
                                  f"the model here is {ends.fingerprint}")
-        t = cls(node, ends, model_dir, work_dir, total_steps=1, rank=rank, alpha=alpha, targets=targets, quiet=True, **kw)
+        t = cls(node, ends, model_dir, work_dir, total_steps=1, rank=rank, alpha=alpha, targets=targets, quiet=True,
+                record_helpers=False, **kw)
         loaded = from_peft(weights, t.layer_prefix)
         if sorted(loaded) != t._order or any(tuple(loaded[k].shape) != tuple(t.adapters[k].shape) for k in loaded):
             raise ValueError("this adapter does not fit the model here")
@@ -621,6 +653,33 @@ class SwarmTrainer:
                     raise ValueError("this adapter contains values that are not numbers")
                 t.adapters[key].copy_(loaded[key])
         return t
+
+    @classmethod
+    def continuing(cls, node, ends, model_dir: str, work_dir: str, adapter_dir: str, **kw) -> "SwarmTrainer":
+        """A trainer that starts from a finished adapter, to train it further.
+
+        Whoever holds an adapter can do this: one they trained, or one a leader shared with them.
+        The rank, alpha and targets are the adapter's own. The new run keeps a record of what it
+        was continued from.
+        """
+        from .team import adapter_fingerprint, continued, fitted
+        prefix, _ = model_shape(model_dir)
+        found = fitted(adapter_dir, prefix, ends.fingerprint, lambda targets: shapes_from_files(model_dir, targets))
+        for key in ("rank", "alpha", "targets", "init"):
+            kw.pop(key, None)
+        t = cls(node, ends, model_dir, work_dir, rank=found["rank"], alpha=found["alpha"], targets=found["targets"],
+                init={k: torch.from_numpy(v) for k, v in found["adapters"].items()}, **kw)
+        t.history = continued(found["facts"], found["name"], adapter_fingerprint(found["adapters"]))
+        return t
+
+    def record(self) -> dict:
+        """What to add to a finished adapter's facts: its run, how many devices helped, what it stands on."""
+        out: dict = {}
+        if self.book is not None:
+            out.update(run=self.book.run, helpers=len(self.book.helpers))
+        if self.history:
+            out["history"] = self.history
+        return out
 
     def _score_with(self, adapters: Dict[str, torch.Tensor], examples: List[Example]) -> Tuple[dict, int, int, int]:
         from .scoring import tally
@@ -634,6 +693,31 @@ class SwarmTrainer:
             return tally(totals[0], totals[1], totals[2]), totals[2], totals[3], totals[4]
         finally:
             self.adapters = mine
+
+    def losses(self, adapters: Dict[str, torch.Tensor], examples: List[Example]) -> List[float]:
+        """The loss on each pair's answer, one number per pair, with the given adapters. Forward only."""
+        mine, self.adapters = self.adapters, adapters
+        try:
+            self._push()
+            out = []
+            for ids, labels in examples:
+                loss, _, tokens, _, _ = self._retry(lambda: self._score_once(ids, labels))
+                out.append(loss / max(1, tokens))
+            return out
+        finally:
+            self.adapters = mine
+
+    def flattery(self, examples: List[Example]) -> dict:
+        """The flattery check (see flattery.py): does the model, with these adapters, find replies that go
+        along with false statements likelier than it did without them? Through the swarm, checked as usual."""
+        from .flattery import card
+        plain = {k: (torch.zeros_like(v) if k.endswith(".B") else v.detach()) for k, v in self.adapters.items()}
+        try:
+            if not self.route and self.ends.own_layers < self.num_layers:
+                self.route = self._connect()
+            return card(self.losses(plain, examples), self.losses(self.adapters, examples))
+        finally:
+            self._close_all()
 
     def compare(self, examples: List[Example], name: str = "", held_out: bool = False) -> dict:
         """A score card: the unchanged model against the model with these adapters, on the same pairs.
@@ -699,4 +783,6 @@ class SwarmTrainer:
                    target_modules=list(self.targets), task_type="CAUSAL_LM",
                    base_model_name_or_path=base_model_name).save_pretrained(out_dir)
         st_save_file(to_peft(self.adapters, self.layer_prefix), os.path.join(out_dir, "adapter_model.safetensors"))
+        if self.book is not None:
+            self.book.copy_to(out_dir)             # lets the devices that helped be offered a copy later
         return out_dir

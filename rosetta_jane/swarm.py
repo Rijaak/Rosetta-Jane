@@ -25,6 +25,15 @@ independent peers and their results are compared at every step.
     That catches a group of liars who never disagree with each other, and it
     works even with a single peer and no second opinion.
 
+Teams
+-----
+An answer can be asked for as part of a team (see team.py). Then only peers that
+have signed on to that team are used, each is told which team the work is for and
+must confirm it, and every layer on the way, this device's own included, runs with
+the team's adapter. The checks above work the same: peers are compared with each
+other, and an auditor recomputes with the adapter. Known-answer tests stay tests of
+the unchanged model, which every peer still serves.
+
 Blocks are local to this device and last while it runs. A blocked peer can
 return under a new identity, which is why checking happens on every step.
 """
@@ -64,9 +73,10 @@ class Generation:
                  redundancy: Optional[int] = 1, tolerance: float = 0.02,
                  auditor: Optional[LocalAuditor] = None, require_verified: bool = False,
                  audit_rate: float = 0.0, seed: Optional[int] = None,
-                 canaries=None, canary_rate: float = 0.2):
+                 canaries=None, canary_rate: float = 0.2, team=None):
         if redundancy is not None and redundancy < 1:
             raise ValueError("redundancy must be at least 1")
+        self.team = team                            # a team.TeamUse: answer with that team's adapter
         self.canaries = canaries                    # known-answer tests prepared on this device
         self.canary_rate = canary_rate
         self.known_answer_tests = 0
@@ -137,6 +147,10 @@ class Generation:
             self._ban(peer)
         return passed
 
+    def _fits(self, service: dict) -> bool:
+        """With a team, only devices that have signed on to it may do its work."""
+        return self.team is None or self.team.id in service.get("teams", ())
+
     def _open(self, hop: Hop) -> None:
         # A peer is tested before it is first trusted, and again at random afterwards.
         if self.canaries is not None and (hop.peer.node_id not in self.node.vetted
@@ -146,11 +160,24 @@ class Generation:
         ch = self.node.dial(hop.peer.addr, timeout=min(30.0, self.rpc_timeout))
         ch.sock.settimeout(self.rpc_timeout)
         try:
-            ch.call({"op": "open", "model": self.ends.fingerprint, "start": hop.start, "end": hop.end})
+            ask = {"op": "open", "model": self.ends.fingerprint, "start": hop.start, "end": hop.end}
+            if self.team is not None:
+                ask["team"] = self.team.id
+                ask.update(self.team.ident(hop.peer.node_id))     # so this member's share of the device is theirs
+            reply = ch.call(ask)[0]
+            if self.team is not None and reply.get("team") != self.team.id:
+                # A peer that does not know about teams would quietly run the unchanged model.
+                raise ProtocolError("peer did not confirm it is working for this team")
         except BaseException:
             ch.close()
             raise
         hop.ch = ch
+
+    def _truth(self, i: int):
+        hop = self.route[i]
+        if self.team is None:
+            return self.auditor.compute(hop.start, hop.end, self._sent[i])
+        return self.auditor.compute(hop.start, hop.end, self._sent[i], team=self.team)
 
     def _shut(self, hop: Hop) -> None:
         if hop.ch is not None:
@@ -189,7 +216,7 @@ class Generation:
                 continue
             for s in p.services:
                 if s["model"] == self.ends.fingerprint and s["variant"] == hop.variant \
-                        and s["layers"][0] <= hop.start and hop.end <= s["layers"][1]:
+                        and s["layers"][0] <= hop.start and hop.end <= s["layers"][1] and self._fits(s):
                     options.append((p, s))
                     break
         # Prefer peers at a different address: several peers on one address are more
@@ -216,7 +243,8 @@ class Generation:
         while True:
             try:
                 hops = plan_route(self.node.table.peers(), self.ends.fingerprint, start_layer,
-                                  self.ends.num_layers, self._excluded(), self.variant)
+                                  self.ends.num_layers, self._excluded(), self.variant,
+                                  team=self.team.id if self.team is not None else None)
             except NoRoute:
                 if time.time() >= deadline:
                     raise
@@ -252,7 +280,6 @@ class Generation:
     # -- checking --------------------------------------------------------------------
     def _settle(self, i: int, outs: List[Tuple[Hop, object]], width: int) -> object:
         """Decide which result for hop i to trust, block the peers that got it wrong."""
-        hop = self.route[i]
         unanimous = len(outs) == 1 or len(_groups(outs, self.tolerance)) == 1
         if unanimous:
             winners = outs
@@ -260,7 +287,7 @@ class Generation:
             if self.audit_rate > 0 and (first_block or self._rng.random() < self.audit_rate):
                 # Agreement proves nothing if they are all telling the same lie. Check anyway.
                 self.spot_audits += 1
-                truth = self.auditor.compute(hop.start, hop.end, self._sent[i])[:, -width:]
+                truth = self._truth(i)[:, -width:]
                 if not agree(outs[0][1], truth, self.tolerance):
                     self.disputes += 1
                     for replica, _ in outs:
@@ -299,7 +326,7 @@ class Generation:
     def _resolve(self, i: int, outs: List[Tuple[Hop, object]], width: int):
         hop = self.route[i]
         if self.auditor is not None:
-            truth = self.auditor.compute(hop.start, hop.end, self._sent[i])[:, -width:]
+            truth = self._truth(i)[:, -width:]
             good = [(r, o) for r, o in outs if agree(o, truth, self.tolerance)]
             if good:
                 return good
@@ -384,7 +411,7 @@ class Generation:
             # and a third to break a tie.
             able = [p for p in self.node.table.peers()
                     if p.node_id not in self._excluded() and p.addr not in self._excluded()
-                    and any(s["model"] == self.ends.fingerprint
+                    and any(s["model"] == self.ends.fingerprint and self._fits(s)
                             and (self.variant is None or s["variant"] == self.variant) for s in p.services)]
             self.redundancy = 2 if len(able) >= 3 else 1
         if self.ends.own_layers < self.ends.num_layers:
@@ -395,7 +422,8 @@ class Generation:
         feed = list(prompt_ids)
         try:
             for _ in range(max_new_tokens):
-                h, cache = self.ends.head(feed, cache)
+                h, cache = self.ends.head(feed, cache) if self.team is None else \
+                    self.ends.head(feed, cache, team=self.team)
                 h = self._through(h)
                 token = pick_token(self.ends.logits(h[:, -1:]), temperature, top_p, gen)
                 if token in stops:

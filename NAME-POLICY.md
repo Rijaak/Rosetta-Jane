@@ -6,8 +6,10 @@ policy says who may use it. It rests on trademark rights in the name, not on the
 
 ## The safeguards the name stands for
 
-1. **Trained adapters are never applied automatically.** A person downloads one adapter at a time, sees how much
-   of its training was checked, and applies it themselves.
+1. **Trained adapters are never applied automatically.** A person sees how an adapter scored and how much of its
+   training was checked, and chooses: they download one adapter and apply it themselves, or they sign on to a
+   team that someone leads with it. A team applies its adapter only for the people and devices that signed on,
+   and only until they leave. A leader starts a team; nobody is put in one.
 2. **The warning comes first.** Before a device starts the p2p service, its owner is shown what that involves
    and has to acknowledge it.
 3. **Honest reporting.** Work that was checked and work that was not are reported as such.

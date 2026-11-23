@@ -76,6 +76,11 @@ public class MainActivity extends Activity {
     private Button askButton, trainButton, pairsButton;
     private TextView answer, trainStatus, pairsNote;
     private LinearLayout adapterList;
+    // Teams: an adapter used together because people signed on. Drawn from what the Python side says.
+    private TextView teamNote;
+    private EditText teamCode, teamName;
+    private LinearLayout teamButtons;
+    private String shownTeamButtons = "", trainFrom = "";
     private boolean asking, training_on;
     private String shownAdapters = "", savingAdapter, lastSide = "";
     private File pairsFile;
@@ -280,6 +285,34 @@ public class MainActivity extends Activity {
         column.addView(trialPanel);
         showTrialMode();
 
+        column.addView(heading("Teams: use an adapter together"));
+        TextView teams = text("A team is how a group chooses to pool its devices, the way players join a co-op game. "
+                + "Anyone can lead one: with an adapter they hold (press \"Lead a team with it\" on an adapter above), "
+                + "or with no adapter, to share computing power for the unchanged model. The leader chooses who can "
+                + "sign on: anyone in the group, people who ask and are approved, or only people with the team's code "
+                + "or an invitation. You are shown the model and the adapter before you join, because everyone in a "
+                + "team uses the same ones. Say yes to an invitation, or have your request approved, and the adapter "
+                + "is supplied at once. Once the leader begins, the team's answers come from the team. Leave, or have "
+                + "the leader end the team, and it is the unchanged model again.\n\n"
+                + "Nothing is applied on a device whose owner did not sign it on. If you build on Rosetta-Jane, keep "
+                + "the signing on. The team screen is modelled on BBSC: Yharnam Together's.", 13);
+        teams.setBackgroundColor(0xFFE8EEF7);
+        teams.setPadding(pad, pad, pad, pad);
+        column.addView(teams);
+        column.addView(label("Your name on team screens (optional; a label, nothing checks it)"));
+        teamName = field(prefs.getString("called", ""), InputType.TYPE_CLASS_TEXT);
+        column.addView(teamName);
+        column.addView(label("Team code (six letters and digits, like DAF H2D)"));
+        teamCode = field("", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+        column.addView(teamCode);
+        teamNote = text("", 15);
+        teamNote.setTextIsSelectable(true);
+        teamNote.setPadding(0, pad / 2, 0, pad / 2);
+        column.addView(teamNote);
+        teamButtons = new LinearLayout(this);
+        teamButtons.setOrientation(LinearLayout.VERTICAL);
+        column.addView(teamButtons);
+
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
         }
@@ -365,8 +398,10 @@ public class MainActivity extends Activity {
     }
 
     private void trainWith(String model, String code, String peerList, int own, String pairs, String name, double epochs) {
+        final String from = trainFrom;
+        trainFrom = "";
         work.execute(() -> PeerService.bridge(this).callAttr("train_start", model, code, peerList.split("[,\\s]+"),
-                pairs, name, epochs, own, getFilesDir().getAbsolutePath()));
+                pairs, name, epochs, own, getFilesDir().getAbsolutePath(), from));
     }
 
     private void showTrialMode() {
@@ -481,6 +516,66 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    /** One press on the Teams part of the screen. The Python side does it; the next refresh shows the result. */
+    private void teamDo(String kind, String what, JSONObject req, boolean needsCode) {
+        String[] c = connection(teamNote);
+        if (c == null) {
+            return;
+        }
+        try {
+            if (needsCode) {
+                String typed = teamCode.getText().toString().trim();
+                if (typed.isEmpty()) {
+                    teamNote.setText("Type the team's code first.");
+                    return;
+                }
+                req = new JSONObject(req.toString()).put("code", typed);
+            }
+            String called = teamName.getText().toString().trim();
+            prefs.edit().putString("called", called).apply();
+            req = new JSONObject(req.toString()).put("_called", called)
+                    .put("_question", question.getText().toString().trim());
+        } catch (Exception e) {
+            Log.e(TAG, "team code", e);
+            return;
+        }
+        final String body = req.toString();
+        teamNote.setText("Working\u2026");
+        work.execute(() -> {
+            try {
+                Log.i(TAG, "TEAM " + kind + " " + what + " [" + PeerService.bridge(this).callAttr("panel_do", c[0], c[1],
+                        c[2].split("[,\\s]+"), Integer.parseInt(c[3]), getFilesDir().getAbsolutePath(), kind, what,
+                        body) + "]");
+            } catch (Exception e) {
+                Log.e(TAG, "team", e);
+            }
+        });
+    }
+
+    private void showTeam(JSONObject panel) throws Exception {
+        teamNote.setText(panel.getString("text"));
+        JSONArray buttons = panel.getJSONArray("buttons");
+        if (buttons.toString().equals(shownTeamButtons)) {
+            return;
+        }
+        shownTeamButtons = buttons.toString();
+        teamButtons.removeAllViews();
+        for (int i = 0; i < buttons.length(); i++) {
+            final JSONObject b = buttons.getJSONObject(i);
+            teamButtons.addView(small(b.getString("label"), v -> teamDo(b.optString("kind"), b.optString("what"),
+                    b.optJSONObject("req") == null ? new JSONObject() : b.optJSONObject("req"),
+                    b.optBoolean("needs_code"))));
+        }
+    }
+
+    private JSONObject named(String name) {
+        try {
+            return new JSONObject().put("name", name);
+        } catch (Exception e) {
+            return new JSONObject();
+        }
+    }
+
     private void showAdapters(JSONArray found) throws Exception {
         if (found.toString().equals(shownAdapters)) {
             return;
@@ -497,6 +592,8 @@ public class MainActivity extends Activity {
             title.setPadding(0, (int) (14 * getResources().getDisplayMetrics().density), 0, 0);
             adapterList.addView(title);
             adapterList.addView(text((a.getBoolean("received") ? "Shared with you by someone else. " : "Trained from this device. ")
+                    + (a.optBoolean("continued") ? "Continued from an earlier adapter. " : "")
+                    + (a.isNull("community") ? "" : "Community rating " + a.optDouble("community") + " out of 5. ")
                     + (a.getBoolean("my_score") ? "You have scored it on your own questions."
                     : a.getBoolean("scored") ? "Scored by the run that trained it." : "Not scored yet."), 13));
             adapterList.addView(small("Try it", v -> {
@@ -514,6 +611,28 @@ public class MainActivity extends Activity {
                 startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
                         .setType("application/zip").putExtra(Intent.EXTRA_TITLE, name + ".zip"), SAVE_ADAPTER);
             }));
+            adapterList.addView(small("Check it for flattery", v -> {
+                String[] c = connection(sideNote);
+                if (c != null) {
+                    sideNote.setText("Checking \"" + name + "\" against the unchanged model on questions built on a "
+                            + "false statement\u2026");
+                    lastSide = "";
+                    work.execute(() -> PeerService.bridge(this).callAttr("adapter_flattery", c[0], c[1],
+                            c[2].split("[,\\s]+"), Integer.parseInt(c[3]), getFilesDir().getAbsolutePath(), name));
+                }
+            }));
+            adapterList.addView(small("Lead a team with it", v -> teamDo("team", "create", named(name), false)));
+            adapterList.addView(small("Train it further", v -> {
+                trainFrom = name;
+                pairsNote.setText("The next training run continues from \"" + name + "\" and saves a new adapter under "
+                        + "the run name below. \"" + name + "\" itself is kept as it is. Choose your pairs and press "
+                        + "Start training.");
+            }));
+            final int helpers = a.optInt("helpers");
+            if (helpers > 0 && !a.getBoolean("received")) {
+                adapterList.addView(small("Offer it to the " + helpers + " device" + (helpers == 1 ? "" : "s")
+                        + " that helped train it", v -> teamDo("share", "open", named(name), false)));
+            }
         }
     }
 
@@ -665,6 +784,15 @@ public class MainActivity extends Activity {
                     in.getStringExtra("auto_group"), in.getStringExtra("auto_peers").split("[,\\s]+"),
                     in.getIntExtra("auto_own", 2), getFilesDir().getAbsolutePath(), in.getStringExtra("auto_name"),
                     in.getStringExtra("auto_score"))));
+        } else if (intent.getStringExtra("auto_team") != null) {
+            final Intent in = intent;
+            work.execute(() -> Log.i(TAG, "TEAM_AUTO [" + PeerService.bridge(this).callAttr("panel_do", model,
+                    in.getStringExtra("auto_group"), in.getStringExtra("auto_peers").split("[,\\s]+"),
+                    in.getIntExtra("auto_own", 2), getFilesDir().getAbsolutePath(),
+                    in.getStringExtra("auto_kind") == null ? "team" : in.getStringExtra("auto_kind"),
+                    in.getStringExtra("auto_team"),
+                    in.getStringExtra("auto_req") == null ? "{}" : in.getStringExtra("auto_req")) + "] "
+                    + PeerService.bridge(this).callAttr("team_poll")));
         } else if (intent.getStringExtra("auto_import") != null) {
             final Intent in = intent;
             work.execute(() -> Log.i(TAG, "IMPORTED [" + PeerService.bridge(this).callAttr("adapter_import",
@@ -724,7 +852,10 @@ public class MainActivity extends Activity {
                     reply += "\n\n" + st.getInt("tokens") + " tokens in " + st.getDouble("seconds") + " s through "
                             + st.getInt("peers") + " device" + (st.getInt("peers") == 1 ? "" : "s") + ": "
                             + st.getInt("checked") + " steps checked, " + st.getInt("unchecked") + " not checked"
-                            + (st.getInt("blocked") > 0 ? ", " + st.getInt("blocked") + " devices blocked" : "") + ".";
+                            + (st.getInt("blocked") > 0 ? ", " + st.getInt("blocked") + " devices blocked" : "") + "."
+                            + (st.isNull("team") ? "" : st.optString("team").equals("no adapter")
+                                ? "\nAnswered on your team's devices." : "\nAnswered with your team's adapter, \""
+                                + st.optString("team") + "\".");
                 } else if (busyAsking && reply.isEmpty()) {
                     reply = "Asking the group\u2026";
                 }
@@ -755,6 +886,13 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 Log.e(TAG, "poll", e);
             }
+            JSONObject teamPanel = null;
+            try {
+                teamPanel = new JSONObject(PeerService.bridge(this).callAttr("team_poll").toString());
+            } catch (Exception e) {
+                Log.e(TAG, "team poll", e);
+            }
+            final JSONObject shownTeam = teamPanel;
             String trialShown = null, sideShown = null;
             boolean sideBusy = false;
             try {
@@ -792,7 +930,8 @@ public class MainActivity extends Activity {
                             Log.i(TAG, "TRIAL " + j);
                         }
                         trialShown = out.toString().trim();
-                    } else if (j.getString("kind").equals("score") && !sideBusy) {
+                    } else if ((j.getString("kind").equals("score") || j.getString("kind").equals("flattery"))
+                            && !sideBusy) {
                         StringBuilder out = new StringBuilder();
                         if (!j.isNull("error")) {
                             out.append(j.getString("error"));
@@ -841,6 +980,9 @@ public class MainActivity extends Activity {
                 }
                 try {
                     showAdapters(list);
+                    if (shownTeam != null) {
+                        showTeam(shownTeam);
+                    }
                 } catch (Exception e) {
                     Log.e(TAG, "adapters", e);
                 }
