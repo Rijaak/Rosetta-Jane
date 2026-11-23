@@ -295,11 +295,13 @@ public class MainActivity extends Activity {
                 + "is supplied at once. Once the leader begins, the team's answers come from the team. Leave, or have "
                 + "the leader end the team, and it is the unchanged model again.\n\n"
                 + "Nothing is applied on a device whose owner did not sign it on. If you build on Rosetta-Jane, keep "
-                + "the signing on. The team screen is modelled on BBSC: Yharnam Together's.", 13);
+                + "the signing on.\n\nThe team screens are modelled on the co-op in Yharnam Together. Thanks to Kaniel, "
+                + "AMANISES (CLS_AMG), Supermedo and everyone who built it.", 13);
         teams.setBackgroundColor(0xFFE8EEF7);
         teams.setPadding(pad, pad, pad, pad);
         column.addView(teams);
-        column.addView(label("Your name on team screens (optional; a label, nothing checks it)"));
+        column.addView(label("Your name on team screens (optional). It is shown with a short tag made from this "
+                + "phone's own key, so people you team with can tell it is this phone again."));
         teamName = field(prefs.getString("called", ""), InputType.TYPE_CLASS_TEXT);
         column.addView(teamName);
         column.addView(label("Team code (six letters and digits, like DAF H2D)"));
@@ -745,6 +747,27 @@ public class MainActivity extends Activity {
         startService(new Intent(this, PeerService.class).setAction(PeerService.ACTION_STOP));
     }
 
+    /** Test builds only: writes what the screen would show to a file a developer can read back. */
+    private void autoDump(String what, String said) {
+        try {
+            com.chaquo.python.PyObject app = PeerService.bridge(this);
+            JSONObject out = new JSONObject().put("what", what).put("said", said)
+                    .put("at", System.currentTimeMillis())
+                    .put("panel", new JSONObject(app.callAttr("team_poll").toString()))
+                    .put("ask", app.callAttr("ask_poll").toString())
+                    .put("status", app.callAttr("status").toString());
+            java.io.File file = new java.io.File(getFilesDir(), "auto-last.json");
+            java.io.File part = new java.io.File(getFilesDir(), "auto-last.json.part");
+            try (java.io.FileWriter w = new java.io.FileWriter(part)) {
+                w.write(out.toString());
+            }
+            part.renameTo(file);
+            Log.i(TAG, "AUTO_DUMP " + what + " " + out.getLong("at"));
+        } catch (Exception e) {
+            Log.e(TAG, "auto dump", e);
+        }
+    }
+
     /** Test builds only: lets a developer start the service from a command instead of the screen. */
     private void automate(Intent intent) {
         boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
@@ -784,15 +807,20 @@ public class MainActivity extends Activity {
                     in.getStringExtra("auto_group"), in.getStringExtra("auto_peers").split("[,\\s]+"),
                     in.getIntExtra("auto_own", 2), getFilesDir().getAbsolutePath(), in.getStringExtra("auto_name"),
                     in.getStringExtra("auto_score"))));
+        } else if (intent.getBooleanExtra("auto_poll", false)) {
+            work.execute(() -> autoDump("poll", ""));
         } else if (intent.getStringExtra("auto_team") != null) {
             final Intent in = intent;
-            work.execute(() -> Log.i(TAG, "TEAM_AUTO [" + PeerService.bridge(this).callAttr("panel_do", model,
-                    in.getStringExtra("auto_group"), in.getStringExtra("auto_peers").split("[,\\s]+"),
-                    in.getIntExtra("auto_own", 2), getFilesDir().getAbsolutePath(),
-                    in.getStringExtra("auto_kind") == null ? "team" : in.getStringExtra("auto_kind"),
-                    in.getStringExtra("auto_team"),
-                    in.getStringExtra("auto_req") == null ? "{}" : in.getStringExtra("auto_req")) + "] "
-                    + PeerService.bridge(this).callAttr("team_poll")));
+            work.execute(() -> {
+                String said = PeerService.bridge(this).callAttr("panel_do", model,
+                        in.getStringExtra("auto_group"), in.getStringExtra("auto_peers").split("[,\\s]+"),
+                        in.getIntExtra("auto_own", 2), getFilesDir().getAbsolutePath(),
+                        in.getStringExtra("auto_kind") == null ? "team" : in.getStringExtra("auto_kind"),
+                        in.getStringExtra("auto_team"),
+                        in.getStringExtra("auto_req") == null ? "{}" : in.getStringExtra("auto_req")).toString();
+                Log.i(TAG, "TEAM_AUTO [" + said + "]");
+                autoDump(in.getStringExtra("auto_team"), said);
+            });
         } else if (intent.getStringExtra("auto_import") != null) {
             final Intent in = intent;
             work.execute(() -> Log.i(TAG, "IMPORTED [" + PeerService.bridge(this).callAttr("adapter_import",

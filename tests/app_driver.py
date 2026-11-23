@@ -8,7 +8,7 @@ import json
 import os
 import sys
 
-BLOCKED = ("torch", "transformers", "safetensors", "peft", "tokenizers", "bitsandbytes")
+BLOCKED = ("torch", "transformers", "safetensors", "peft", "tokenizers", "bitsandbytes", "cryptography")
 
 
 class Blocker(importlib.abc.MetaPathFinder):

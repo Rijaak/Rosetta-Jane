@@ -30,10 +30,8 @@ one point a minute. In a team that same leader runs for querying, a member can s
 on a larger share of the team's computing power: each point is 1% more, for an hour (see
 fair.py for how devices share their time out).
 
-There is no bank. Points are counted by the leader whose teaching they were earned in, and
-are good in that leader's teams only: with no accounts and no server, there is nobody every
-team would trust to keep a common tally. The leader's own device keeps it, so this is a
-courtesy among people who chose to work together, not money.
+This file counts the points (RunBook) and keeps a helper's tickets (HelpLog). Turning them
+into signed receipts that are good in any team is points.py.
 
 Plain Python and NumPy, shared by the desktop program and the phone app.
 """
@@ -67,6 +65,10 @@ SECONDS_PER_POINT = 60.0           # a minute of accepted teaching work earns on
 BOOST_SECONDS = 3600.0             # a spent point lasts an hour
 MAX_BOOST = 100                    # points in force for one member at once: at most double a plain share
 LEDGER = "teaching-points.json"
+
+
+def _key(raw) -> str:
+    return raw if isinstance(raw, str) and re.match(r"^[0-9a-f]{64}$", raw) else ""
 
 
 def ticket(secret: bytes, node_id: str) -> str:
@@ -152,19 +154,23 @@ class HelpLog:
                 for run, e in data.items() if isinstance(data, dict) else []:
                     if _RUN.match(run) and isinstance(e, dict) and _TICKET.match(str(e.get("ticket"))) \
                             and _NODE.match(str(e.get("as"))):
-                        self.runs[run] = {"ticket": e["ticket"], "as": e["as"],
+                        self.runs[run] = {"ticket": e["ticket"], "as": e["as"], "by": _key(e.get("by")),
                                           "examples": int(e.get("examples", 0)), "last": float(e.get("last", 0))}
             except (OSError, ValueError, TypeError):
                 pass
 
-    def note(self, run, given, node_id: str) -> Optional[str]:
-        """A trainer has opened a training session here and handed over a ticket. Returns the run, if usable."""
+    def note(self, run, given, node_id: str, by=None) -> Optional[str]:
+        """A trainer has opened a training session here and handed over a ticket. Returns the run, if usable.
+        `by` is the key the trainer says is theirs: where to ask for a receipt later."""
         if not (isinstance(run, str) and _RUN.match(run) and isinstance(given, str) and _TICKET.match(given)):
             return None
         with self._lock:
             entry = self.runs.get(run)
             if entry is None or entry["examples"] == 0:      # a ticket that has done work is the one to keep
-                self.runs[run] = {"ticket": given, "as": node_id, "examples": 0, "last": time.time()}
+                self.runs[run] = {"ticket": given, "as": node_id, "by": _key(by), "examples": 0,
+                                  "last": time.time()}
+            elif not entry.get("by") and _key(by):
+                entry["by"] = _key(by)
             while len(self.runs) > MAX_REMEMBERED:
                 # forget runs this device never finished any work for first, then the oldest
                 del self.runs[min(self.runs, key=lambda r: (self.runs[r]["examples"] > 0, self.runs[r]["last"]))]
@@ -187,7 +193,7 @@ class HelpLog:
     def tickets(self) -> List[dict]:
         """The tickets for runs this device did work in: what it shows a leader to use its teaching points."""
         with self._lock:
-            return [{"run": run, "as": e["as"], "ticket": e["ticket"]}
+            return [{"run": run, "as": e["as"], "ticket": e["ticket"], "by": e.get("by", "")}
                     for run, e in self.runs.items() if e["examples"] > 0]
 
     def save(self) -> None:
@@ -203,8 +209,8 @@ class HelpLog:
 
 
 class Ledger:
-    """A leader's tally of teaching points: earned in the training runs recorded in this work folder,
-    less what has been spent. It answers for this leader's teams only."""
+    """What a leader's training runs earned each helper: read from the run books in this work folder.
+    Receipts for it, and the tally of what has been spent, are points.Bank's."""
 
     def __init__(self, work_dir: Optional[str]):
         self.work_dir = work_dir
@@ -228,14 +234,6 @@ class Ledger:
                 found[book.run] = book
         return found
 
-    def _spent(self) -> Dict[str, int]:
-        try:
-            with open(os.path.join(self.work_dir or "", LEDGER)) as f:
-                data = json.load(f)
-            return {k: int(v) for k, v in data.items() if isinstance(v, int) and v >= 0}
-        except (OSError, ValueError, AttributeError):
-            return {}
-
     def _valid(self, tickets) -> List[tuple]:
         books, out, seen = self._books(), [], set()
         for t in tickets if isinstance(tickets, list) else []:
@@ -249,30 +247,6 @@ class Ledger:
             seen.add((run, who))
             out.append((f"{run}:{who}", book.points(who)))
         return out
-
-    def balance(self, tickets) -> int:
-        """Points the holder of these tickets has left with this leader."""
-        with self._lock:
-            spent = self._spent()
-            return sum(max(0, earned - spent.get(key, 0)) for key, earned in self._valid(tickets))
-
-    def spend(self, tickets, points: int) -> int:
-        """Take points off the holder's tally. Returns what is left. Raises ValueError if there are too few."""
-        if isinstance(points, bool) or not isinstance(points, int) or points < 1:
-            raise ValueError("spend a whole number of points, 1 or more")
-        with self._lock:
-            spent = self._spent()
-            valid = self._valid(tickets)
-            have = sum(max(0, earned - spent.get(key, 0)) for key, earned in valid)
-            if have < points:
-                raise ValueError(f"that takes {points} teaching points with this leader; this device has {have}")
-            left = points
-            for key, earned in valid:
-                take = min(left, max(0, earned - spent.get(key, 0)))
-                spent[key] = spent.get(key, 0) + take
-                left -= take
-            _write(os.path.join(self.work_dir, LEDGER), spent)
-            return have - points
 
 
 def _config(folder: str) -> dict:

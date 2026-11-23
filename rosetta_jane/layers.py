@@ -349,7 +349,7 @@ class LayerServer:
             session = {"layers": nn.ModuleList(layers), "first": x, "rank": rank, "scale": alpha / rank,
                        "targets": targets, "shapes": shapes, "adapters": None, "graph": None,
                        "last": time.time(),
-                       "run": self.helped.note(header.get("run"), header.get("ticket"), self._node_id)}
+                       "run": self.helped.note(header.get("run"), header.get("ticket"), self._node_id, header.get("by"))}
             self._sessions.append(session)
             state["training"] = session
         ch.send({"op": "t_open_ok", "variant": self.variant})

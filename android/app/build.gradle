@@ -21,6 +21,9 @@ tasks.register("stagePython", Sync) {
         include "rosetta_jane/helpers.py"
         include "rosetta_jane/fair.py"
         include "rosetta_jane/flattery.py"
+        include "rosetta_jane/sign.py"
+        include "rosetta_jane/identity.py"
+        include "rosetta_jane/points.py"
         include "rosetta_jane/lan/__init__.py"
         include "rosetta_jane/lan/protocol.py"
         include "rosetta_jane/mobile/*.py"
@@ -36,7 +39,7 @@ android {
         applicationId "org.rosettajane.app"
         minSdk 24
         targetSdk 34
-        versionCode 2
+        versionCode 3
         versionName "0.2.0"
         ndk {
             abiFilters "arm64-v8a", "x86_64"

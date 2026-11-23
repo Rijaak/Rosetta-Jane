@@ -217,6 +217,8 @@ def main(argv=None) -> int:
     os.makedirs(args.work_dir, exist_ok=True)
     node = Node(secret, args.listen, encrypt=not args.no_encrypt, bootstrap=args.peer, beacon=args.lan,
                 peers_file=os.path.join(args.work_dir, "peers.json"))
+    from .. import identity
+    identity.of(node, args.work_dir)               # this device's own key, kept in its work folder
     node.handoffs = HandoffLog(os.path.join(args.work_dir, "handoffs.jsonl"), node.node_id)
     node.start()
     try:

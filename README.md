@@ -8,7 +8,7 @@ Rosetta-Jane is a companion to [Project NOMAD](https://github.com/Crosstalk-Solu
 
 ## Status: early, and not yet run on real hardware
 
-**Tested** (182 automated tests, tiny random models, CPU only, real network connections on one machine):
+**Tested** (188 automated tests, tiny random models, CPU only, real network connections on one machine):
 
 - Text produced through a chain of peers matches the whole model on one machine, token for token, and the scores behind every token match too.
 - That holds when the route uses only part of a peer's layers, and when a peer dies mid-answer and others take over.
@@ -20,7 +20,9 @@ Rosetta-Jane is a companion to [Project NOMAD](https://github.com/Crosstalk-Solu
 - The three ways in (open, ask, invisible), requests approved and declined, invitations, a device made invisible, removing a device, a team with no adapter using only its own devices, the separate teaching lobby, and training inside a teaching team.
 - Community ratings over several questions given, changed, kept with the adapter and shown to the next person, with no average from fewer than five people; blind comparisons made, answered and revealed.
 - The flattery check's numbers through the swarm match the whole model's on one machine, with and without the adapter.
-- Teaching points earned by timed work, spent with the same leader, refused when forged, shown twice or from another leader; a device's time shared between flows in proportion to their weights, with nobody starved; another member's share cannot be taken by carrying their tag.
+- Teaching points earned by timed work and handed over as a receipt signed with the leader's key; spent in the same leader's team and in another leader's; refused when forged, altered, made out to another device, out of date, or already spent. The leader who issued points keeping the tally exact while in the group; points taken unconfirmed while that leader is away, and passed on when they return. A leader's choice of whose points their team takes, including a stranger's self-signed points being refused by default.
+- A device's time shared between flows in proportion to their weights, with nobody starved; another member's share cannot be taken by carrying their tag.
+- Device keys: signatures checked against the examples in RFC 8032, in plain Python (as on a phone) and with the `cryptography` library; a name shown with its key's tag; a key claimed without its signature shown as no key; a device remembering who it has teamed with.
 - The devices that helped train an adapter can be offered a copy and take it; a device with no ticket, or a made-up one, cannot. A copy can be trained further, and the new adapter records what it came from.
 - Training one model across several PCs on a local network matches single-machine training (see `docs/TRAINER.md`).
 - The Ollama-style interface answers `/api/chat` and `/api/generate`, streaming or not.
@@ -35,8 +37,9 @@ Rosetta-Jane is a companion to [Project NOMAD](https://github.com/Crosstalk-Solu
 - A real NOMAD install talking to it.
 - Speed, or more than a handful of peers.
 - Local-network discovery by broadcast (only tested with direct packets).
-- Teams with more than a handful of devices, or on real models. The Android app's Teams section on a phone.
+- Teams with more than a handful of devices, or on real models. The Android app on a handheld phone. On the cloud phone, the app's rating and blind-comparison buttons, requests and invitations were not pressed, and the release build was not installed (the test build of the same code was).
 - Teaching points over real hours, or how shares feel on real models: the sharing rule is tested by the order work is served in, not by timing real answers.
+- Device keys and points between real machines, or with clocks that disagree. Signed messages are accepted up to a day old, to allow for wrong clocks.
 - The flattery check on a real model. On the tiny random test model its numbers mean nothing; only the arithmetic and the route are tested. Whether its 24 questions separate a flattering adapter from an honest one has not been tried.
 
 There has been no outside security review.
@@ -304,13 +307,13 @@ If you build on Rosetta-Jane, keep this step. Removing it trades a minute of som
 
 ## Teams: pool devices together, with or without an adapter
 
-A team is a group of people and devices that have chosen to work together through the swarm. It works the way co-op does in video games, and its team screen is modelled on the one in [BBSC: Yharnam Together](https://github.com/Amanises-Yharnam-Together/BBSC-Yharnam-Together), the community co-op project for Bloodborne's PC port. Nothing about it is automatic.
+A team is a group of people and devices that have chosen to work together through the swarm. It works the way co-op does in video games, and the team screens are modelled on the co-op in [Yharnam Together](https://github.com/Amanises-Yharnam-Together/BBSC-Yharnam-Together), the community co-op project for Bloodborne's PC port. Nothing about it is automatic.
 
 - **Anyone can lead a team.** A team is for one model, and either for one adapter the leader holds, or for no adapter at all. With an adapter, the team's answers come from the model with that adapter. With none, the team simply pools its devices' computing power to run the unchanged model.
 - **Two lobbies.** Teams that query the model (session teams) and teams that train an adapter (teaching teams) are listed apart. Everyone on a session team can ask, for as long as they are signed on, and nobody sees anyone else's questions or answers. A teaching team gives its power to training: a device signed on to one asks no questions until it leaves.
 - **The model and the adapter are listed before anyone joins**, each with where you get it. The adapter is available to download for the session: the leader's device sends it when you join, it is not kept afterwards, and the listing says if you already hold it yourself. The model is not sent through a team: everyone needs the same model files already, and the listing says plainly whether you have them.
 - **The evidence is shown too**: the teacher rating, the flattery check and the community rating (see "Ratings" below).
-- **A name on team screens.** Each person can choose a name that leaders and teammates see in place of an address. It is a label: nothing checks whose it is.
+- **A name that travels with your device's key.** Each device makes a secret key of its own the first time it runs and keeps it in its work folder (`identity.json`). The name you choose is shown with a short tag made from that key, like `Sam [3f9a2c]`. Anyone can type the name Sam; only your device can show that tag, because signing on to a team means signing with the key. Your device remembers the keys it has teamed with, so you are told "you have teamed with this device before", and warned when a name you know turns up with a different key. A leader's name and tag are shown before you sign on.
 - **The leader chooses who can sign on**, can change it at any time, and the choice is remembered for their next team:
   - **open**: anyone in the group sees the team and can sign on. This is what quick match finds.
   - **ask**: anyone in the group sees the team and can ask to join. The leader approves or declines each request.
@@ -350,7 +353,7 @@ rosetta_jane serve --model /models/base --layers 8:16 --team-invited
 rosetta_jane train --model /models/base --peer 203.0.113.5:7700 --data pairs.jsonl --team "DAF H2D"
 ```
 
-`team lead` and `team join` stay in the terminal. A leader types `who`, `begin`, `devices`, `invite ADDRESS`, `requests`, `approve N`, `decline N`, `remove N`, `open`, `ask`, `invisible` or `end`; a member types `who`, `rate`, `blind`, `points`, `boost N` or `leave`; anything else is a question for the model. `--invisible-device` keeps the device off leaders' invite lists, and `--called NAME` sets the name you go by. The gateway offers the same through `/api/rosetta/team/...` (create, list, look, join, ask, cancel, quick, begin, settings, devices, invite, approve, decline, remove, rate, blind, pick, points, boost, leave) for a front end, and the Android app has a Teams section. NOMAD's settings page does not have team buttons yet.
+`team lead` and `team join` stay in the terminal. A leader types `who`, `begin`, `devices`, `invite ADDRESS`, `requests`, `approve N`, `decline N`, `remove N`, `open`, `ask`, `invisible`, `honour teamed|anyone|mine` or `end`; a member types `who`, `rate`, `blind`, `points`, `boost N` or `leave`; anything else is a question for the model. `--invisible-device` keeps the device off leaders' invite lists, `--called NAME` sets the name you go by, and `--honour` sets whose teaching points your team takes. The gateway offers the same through `/api/rosetta/team/...` (create, list, look, join, ask, cancel, quick, begin, settings, devices, invite, approve, decline, remove, rate, blind, pick, points, boost, wallet, leave) for a front end, and the Android app has a Teams section. NOMAD's settings page does not have team buttons yet.
 
 Things to know:
 
@@ -392,18 +395,27 @@ Limits: with no accounts, marks cannot be tied to people, and a leader's device 
 
 ### Teaching points
 
-A device in a teaching team gives its power to training and asks no questions, so teaching is rewarded.
+A device in a teaching team gives its power to training and asks no questions, so teaching is rewarded. Points earned with one leader can be spent in any team.
 
 - **Earning.** The leader's device times the work it accepts from each helping device. A minute of accepted teaching work is one point.
-- **Spending.** In a session team run by that same leader, a member can spend points on a larger share of the team's computing power: each point is 1% more, for an hour. At most 100 points can be in force for one member at once, a doubled share.
+- **Receipts.** The leader's device signs a receipt with its key: this many points, from this training run, belong to that device's key. Your device fetches its receipts from any leader who is in the group and keeps them (`teaching-receipts.json`). Anyone can check a receipt's signature without asking anybody. A receipt can be spent for 90 days.
+- **Spending.** In a session team, a member can spend points on a larger share of the team's computing power: each point is 1% more, for an hour. At most 100 points can be in force for one member at once, a doubled share. Your device signs each spend with its own key, so only the device a receipt was made out to can spend it.
+- **Keeping count.** The leader who signed a receipt is the bank for it. When its points are spent in someone else's team, that team's leader asks the issuing leader's device, if it is in the group, and it keeps the tally exact: the same points cannot be spent twice. If the issuing leader is away, the team's leader can still take the points on the strength of the signatures, and their device passes the spend on when the issuer is next seen.
+- **Whose points a team takes** is its leader's choice, shown before anyone signs on: `teamed` (the default: points from leaders whose teams this leader has themselves signed on to), `anyone`, or `mine` (only points earned with this leader).
 - **Sharing a device's time out.** Each serving device in the team shares its time between the members using it in proportion to their weights (100, plus points in force), by weighted fair queuing, the principle internet providers use to share a line. It only matters while a device is busy; share one member does not use goes to the others; and nobody is starved, however many points someone else spends.
 
 ```
-points        your teaching points with this team's leader, and any share you have bought
+points        the teaching points this device holds, and any share you have bought
 boost 10      spend 10 points: 10% more of the team's computing power for an hour
+honour anyone (the leader) take points from any leader; or teamed, or mine
 ```
 
-What points are not: there is no bank. Points are counted by the leader whose teaching they were earned in, and are good in that leader's teams only, led from the same work folder the training ran in. With no accounts and no server there is nobody every team would trust to keep one tally. The leader's own device keeps it, so this is a courtesy among people who chose to work together, not money. A device's points are tied to the tickets in its work folder (`helped.json`); lose that and they are gone. Devices in a teaching team still answer other people's sessions between pieces of training work.
+What this cannot do. There is no server, so there is no bank everyone trusts, and two things stay possible:
+
+- **Spending twice.** While the leader who issued some points is away, those points could be spent in two teams that both take them unconfirmed. The issuer's tally shows it afterwards; nothing is taken back. A leader who does not want that can refuse unconfirmed points (`unconfirmed: false` in the team settings).
+- **Made-up points.** A leader can sign points nobody earned, for themselves or a friend. That is why the default is `teamed`: your team takes points only from leaders whose teams you chose to sign on to. Someone signing on to your team does not count, so a stranger cannot arrange it.
+
+The stakes are kept low on purpose. Points buy a larger share of one team's computing power for an hour, never more than double, among people who chose to team up. They are not money and cannot be traded or cashed in. A device's points depend on three files in its work folder: its key (`identity.json`), its receipts, and its tickets (`helped.json`). Lose the key and the receipts cannot be spent. Devices in a teaching team still answer other people's sessions between pieces of training work.
 
 ## Sharing an adapter with the devices that helped train it, and training it further
 
@@ -511,7 +523,7 @@ What is tested, always in a process where PyTorch cannot be imported at all:
 - **Training.** A run started from a phone-style device gives the same trained weights as one machine, outvotes a lying peer, and carries on after being stopped. The result is a standard adapter with the same facts file, and nothing applies it.
 - **Text.** The tokenizer and chat formatting are written without the usual libraries and agree with them on every sample, for the tokenizer designs the supported families use. Real models' tokenizer files could not be downloaded where the tests run, so the first real model is the real test.
 - **Teams and sharing.** A phone-style peer signed on to a team applies the adapter for that team only, and it and a desktop peer check each other with the adapter applied. A phone-style device asking in a team gets the whole model's answer with the adapter. The calls behind the app's Teams buttons (look, sign on, ask to join, lead with or without an adapter, approve, invite, remove, begin, end, go invisible, take an offered adapter, train further) were run against desktop peers.
-- **On Android.** Version 0.1 of the app was run on a cloud Pixel 9 (Android 14): the p2p service, asking, and a training run all gave the expected results with a tiny test model. The Teams section added in 0.2 has not been tapped through on a phone or an emulator yet.
+- **On Android.** Version 0.1 of the app was run on a cloud Pixel 9 (Android 14): the p2p service, asking, and a training run all gave the expected results with a tiny test model. A test build of version 0.2.0 was run on the same kind of cloud phone, against PCs standing in for two leaders. The phone made its own key and signed with it in plain Python; signed on to a teaching team and did training work; fetched its receipt and spent points with the same leader and then in a second leader's team, which refused them by default and took them once that leader chose to, with the first leader's device confirming; got answers through a team that matched the whole model with the adapter; and led a team that a PC signed on to and asked through. On the screen itself these buttons were pressed and did what they say: choosing whose points a team takes, End the team, Find teams in my group, Look at a team, Sign on, See my teaching points, and Spend 5 points. Points were earned at a speeded-up rate for the test. The link between the cloud phone and the test PCs dropped twice during the run, which is why the rating buttons were not reached.
 
 Limits: it computes in 32-bit floats, so it is a `float32` peer and is compared only with other `float32` peers (start a desktop peer with `--dtype float32` to pair with it). It needs four bytes of memory per weight, so a phone holds a few layers of a small model. When asking or training from a phone, known-answer tests and rechecking on the device are not available yet; comparison between peers is. Nothing has run on a handheld phone or with a real model.
 
@@ -541,7 +553,8 @@ That comparison is kept as a discussion, so it can be argued with: https://githu
 - One answer at a time per gateway.
 - A device is in one team at a time as an asker (a device that only serves layers can serve several). A device does not route its own questions through the layers it serves itself.
 - Swarm training has only been run on tiny models; expect it to be slow on real ones.
-- No rewards for serving answers. Teaching work earns teaching points, which are good with that one leader only (see "Teaching points").
+- No rewards for serving answers. Teaching work earns teaching points (see "Teaching points").
+- A device's key is only as safe as its work folder. Anyone who copies `identity.json` is, to everyone else, that device. Keys cannot be withdrawn or replaced yet.
 - Known-answer tests are prepared automatically on the first run, which makes that first start slow. Peers of another precision still need a `calibrate` run with that precision's options.
 - No automatic port opening on routers.
 - Text only.
@@ -557,7 +570,7 @@ python -m pytest tests -q
 
 Rosetta-Jane is the work of its author, Rijaak, who conceived and directed it. Code was written with the assistance of Claude AI. It was inspired, in both concept and interface, by [Project N.O.M.A.D.](https://github.com/Crosstalk-Solutions/project-nomad) and the people who made it.
 
-The way teams work (a leader, a team code, teams people can see and ask to join, invitations, staying invisible, a leader's settings that are remembered) is modelled on the co-op team screen of [BBSC: Yharnam Together](https://github.com/Amanises-Yharnam-Together/BBSC-Yharnam-Together), with thanks to the team who built it. None of their code is used here.
+The team screens are modelled on the co-op in [Yharnam Together](https://github.com/Amanises-Yharnam-Together/BBSC-Yharnam-Together). Thanks to Kaniel, AMANISES (CLS_AMG), Supermedo and everyone who built it. No code from that project is used here.
 
 Rosetta-Jane is an independent project and is not affiliated with or endorsed by either. See `CONTRIBUTORS.md`.
 

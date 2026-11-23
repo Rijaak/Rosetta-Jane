@@ -64,6 +64,8 @@ def _node(args, quiet: bool = False):
     os.makedirs(args.work_dir, exist_ok=True)
     node = Node(secret, args.listen, encrypt=not args.no_encrypt, bootstrap=args.peer, beacon=args.lan,
                 peers_file=os.path.join(args.work_dir, "peers.json"), quiet=quiet)
+    from . import identity
+    identity.of(node, args.work_dir)               # this device's own key, kept in its work folder
     if not args.no_handoff_log:
         from .handoff import HandoffLog
         node.handoffs = HandoffLog(os.path.join(args.work_dir, "handoffs.jsonl"), node.node_id)
@@ -562,8 +564,8 @@ def _team_session(node, gateway, args) -> int:
             for r in t.requests() if leading and t.ended is None else []:
                 if r["id"] not in told:
                     told.add(r["id"])
-                    print(f"\n[team] A device at {r['who']} asks to join. Type: approve {r['id']}   or   "
-                          f"decline {r['id']}", flush=True)
+                    print(f"\n[team] {r['who']} asks to join" + (f" ({r['about']})" if r.get("about") else "")
+                          + f". Type: approve {r['id']}   or   decline {r['id']}", flush=True)
             if seen is not None and now != seen:
                 if now[1] is not None:
                     print(f"\n[team] The team is over: {now[1]}. Answers are from the unchanged model again. "
@@ -578,14 +580,19 @@ def _team_session(node, gateway, args) -> int:
     threading.Thread(target=watch, daemon=True).start()
     teaching = gateway.team.kind == "teaching"
     rates = not leading and not teaching and gateway.team.desc.get("adapter") is not None
+    me = gateway.desk.who()
+    print(f"On team screens you are {me['shown']}. The tag in brackets comes from this device's own key; "
+          "the name is whatever you chose.")
     print("Commands: " + (("" if teaching else "begin, ") + "who, devices, invite ADDRESS, requests, approve N, "
-                          "decline N, remove N, open | ask | invisible (who can sign on), end. "
+                          "decline N, remove N, open | ask | invisible (who can sign on), "
+                          + ("" if teaching else "honour teamed | anyone | mine (whose teaching points the team "
+                                                "takes), ") + "end. "
                           if leading else "who, " + ("rate (answer a few questions about the adapter), blind [QUESTION] "
                                               "(two unlabelled answers; you say which was right), " if rates else "")
                           + "leave. ")
           + ("A teaching team does not query: this device asks no questions until it leaves." if teaching else
              "Anything else is a question.")
-          + ("" if leading or teaching else "\nTeaching points with this leader: type points to see them, "
+          + ("" if leading or teaching else "\nTeaching points: type points to see what this device holds, "
              "boost N to spend N (each is 1% more of the team's computing power, for an hour)."))
     told = set()
     try:
@@ -617,10 +624,17 @@ def _team_session(node, gateway, args) -> int:
                 if not leading and (text == "points" or word == "boost"):
                     got = gateway.team_control("points" if text == "points" else "boost",
                                                {"points": int(rest) if rest.strip().isdigit() else 0})["points"]
-                    print(f"Teaching points with this leader: {got['balance']}. "
+                    held = ", ".join(f"{row['left']} from {row['from']}" for row in got["from"])
+                    print(f"Teaching points this device holds: {got['balance']}" + (f" ({held})" if held else "")
+                          + ". "
                           + (f"In force now: {got['boost']} (your share of the team's computing power is "
                              f"{100 + got['boost']} to everyone else's 100), for {got['minutes']} more minutes."
                              if got["boost"] else "None in force."))
+                    if got.get("note"):
+                        print(got["note"])
+                    if any(not t.get("confirmed") for t in got.get("taken", [])):
+                        print("Some of those points were taken without their own leader confirming them, because "
+                              "that leader is not in the group right now.")
                     continue
                 if text in ("end", "leave", "quit", "exit"):
                     if rates and t.rated is None:
@@ -637,9 +651,11 @@ def _team_session(node, gateway, args) -> int:
                                                      if card["serves"] else "") if x)
                         print(f"  {card['who']}: {card['state']}" + (f" ({role})" if role else "")
                               + (f"   +{card['boost']}% share" if card.get("boost") else "")
+                              + (f"   {card['about']}" if card.get("about") else "")
                               + (f"   [remove {card['id']}]" if card.get("id") else ""))
                     for q in r.get("requests", []):
-                        print(f"  Asking to join: a device at {q['who']}   [approve {q['id']} / decline {q['id']}]")
+                        print(f"  Asking to join: {q['who']}" + (f" ({q['about']})" if q.get("about") else "")
+                              + f"   [approve {q['id']} / decline {q['id']}]")
                     if not leading:
                         print(f"  {r['members']} devices in the team.")
                     if r.get("missing"):
@@ -654,8 +670,13 @@ def _team_session(node, gateway, args) -> int:
                     print(f"Who can sign on: {JOINING_WORDS[text]}. Remembered for your next team.")
                 elif leading and text == "requests":
                     waiting = gateway.team_report()["requests"]
-                    print("\n".join(f"  a device at {q['who']}: approve {q['id']} / decline {q['id']}"
+                    print("\n".join(f"  {q['who']}" + (f" ({q['about']})" if q.get("about") else "")
+                                    + f": approve {q['id']} / decline {q['id']}"
                                     for q in waiting) or "  Nobody is asking to join.")
+                elif leading and word == "honour" and not teaching:
+                    from .team import HONOURS_WORDS
+                    gateway.team_control("settings", {"honours": rest.strip()})
+                    print(f"This team now takes {HONOURS_WORDS[rest.strip()]}. Remembered for your next team.")
                 elif leading and word in ("approve", "decline"):
                     gateway.team_control(word, {"request": rest.strip()})
                     print("Approved: it is signed on and supplied with the adapter at its next check."
@@ -669,9 +690,10 @@ def _team_session(node, gateway, args) -> int:
                 elif leading and text == "devices":
                     for d in gateway.team_control("devices", {})["devices"]:
                         what = f"serves layers {d['serves'][0]}-{d['serves'][1] - 1}" if d["serves"] else "not serving"
-                        print(f"  {d['addr']:<24} {(d['name'] or '-'):<16} {what}" + ("  in the team" if d["in_team"] else
-                                                               "  invited" if d["invited"] else
-                                                               "  in another team" if d["busy"] else ""))
+                        print(f"  {d['addr']:<24} {(d['who'] or '-'):<24} {what}"
+                              + ("  in the team" if d["in_team"] else "  invited" if d["invited"] else
+                                 "  in another team" if d["busy"] else "")
+                              + (f"  ({d['about']})" if d.get("about") else ""))
                 else:
                     ids = gateway.chat_ids([{"role": "user", "content": text}])
                     final = gateway.answer(ids, {"temperature": args.temperature},
@@ -733,6 +755,8 @@ def cmd_team_lead(args) -> int:
         if args.teaching and args.adapter:
             raise ValueError("a teaching team is not led with an adapter. To train an adapter further, start "
                              "the run with `train --team CODE --from-adapter FOLDER`.")
+        if args.honour is not None:
+            gateway.team_control("settings", {"honours": args.honour})
         host = gateway.desk.lead(args.adapter, os.path.basename(os.path.normpath(args.adapter)) if args.adapter
                                  else None, args.joining, args.limit, kind="teaching" if args.teaching else "session")
     except ValueError as e:
@@ -1045,6 +1069,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "invisible (not listed; code or invitation only). Default: what you chose last time, "
                         "or open.")
     s.add_argument("--limit", type=int, default=None, help="most devices in the team")
+    s.add_argument("--honour", choices=["teamed", "anyone", "mine"], default=None,
+                   help="whose teaching points this team takes: teamed (points from leaders whose teams this "
+                        "device has signed on to), anyone, or mine (only points earned with you). Default: what "
+                        "you chose last time, or teamed.")
     s.add_argument("--teaching", action="store_true",
                    help="lead a teaching team, for training an adapter together. It is listed in its own lobby, "
                         "apart from teams that query the model")

@@ -125,6 +125,7 @@ class Peer:
     invites: bool = False      # its owner sees invitations to teams, and has not chosen to be invisible
     busy: bool = False         # it is in a team right now
     name: str = ""             # what its owner chose to be called on team screens; a label, never checked
+    key: str = ""              # the public key it says is its own; proven only when it signs something
 
 
 class PeerTable:
@@ -139,7 +140,7 @@ class PeerTable:
 
     def confirm(self, node_id: str, addr: str, services: List[dict], leads: Optional[List[str]] = None,
                 gifts: Optional[List[str]] = None, invites: bool = False, busy: bool = False,
-                name: str = "") -> None:
+                name: str = "", key: str = "") -> None:
         with self._lock:
             self._candidates.pop(addr, None)
             for other_id, p in list(self._peers.items()):   # an address now belongs to a new node
@@ -147,7 +148,7 @@ class PeerTable:
                     del self._peers[other_id]
             if len(self._peers) < MAX_PEERS or node_id in self._peers:
                 self._peers[node_id] = Peer(node_id, addr, services, time.time(), 0, list(leads or []),
-                                            list(gifts or []), invites, busy, name)
+                                            list(gifts or []), invites, busy, name, key)
 
     def suggest(self, addr: str) -> None:
         if not isinstance(addr, str) or not _ADDR_RE.match(addr):
@@ -188,7 +189,7 @@ class PeerTable:
     def peers(self) -> List[Peer]:
         with self._lock:
             return [Peer(p.node_id, p.addr, [dict(s) for s in p.services], p.seen, p.failures, list(p.leads),
-                         list(p.gifts), p.invites, p.busy, p.name) for p in self._peers.values()]
+                         list(p.gifts), p.invites, p.busy, p.name, p.key) for p in self._peers.values()]
 
     def candidates(self) -> List[str]:
         with self._lock:
@@ -221,6 +222,7 @@ class Node:
         self.services_fn: Callable[[], List[dict]] = lambda: []
         self.notices: Dict[str, Callable[[], List[str]]] = {}   # "leads" and "gifts": ids announced to the group
         self.presence: Optional[Callable[[], dict]] = None       # {"invites": bool, "busy": bool}, for invite lists
+        self.identity = None                                     # this device's key (identity.Identity), once it has one
         self.gossip_interval = gossip_interval
         self.quiet = quiet
         self._bootstrap = list(bootstrap or [])
@@ -283,6 +285,8 @@ class Node:
             said = self.notices[kind]()[:MAX_NOTICES] if kind in self.notices else []
             if said:
                 out[kind] = said
+        if self.identity is not None:
+            out["key"] = self.identity.key
         if self.presence is not None:
             here = self.presence()
             out["presence"] = {"invites": bool(here.get("invites")), "busy": bool(here.get("busy")),
@@ -382,7 +386,9 @@ class Node:
                 return False
             self.table.confirm(node_id, addr, clean_services(hello.get("services", [])),
                                clean_ids(hello.get("leads"), MAX_NOTICES),
-                               clean_ids(hello.get("gifts"), MAX_NOTICES), **clean_presence(hello.get("presence")))
+                               clean_ids(hello.get("gifts"), MAX_NOTICES), **clean_presence(hello.get("presence")),
+                               key=hello.get("key") if isinstance(hello.get("key"), str)
+                               and re.match(r"^[0-9a-f]{64}$", hello["key"]) else "")
             reply, _, _ = ch.call({"op": "peers"})
             shared = reply.get("peers", [])
             if isinstance(shared, list):

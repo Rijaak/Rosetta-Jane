@@ -103,6 +103,15 @@ def test_the_app_leads_joins_shares_and_trains_further(model_dir, adapter, refer
         host.begin(2)
         assert wait_for(lambda: "Begun: your answers use the adapter" in panel()["text"], 20)
         assert answer() == (tuned, "field-notes")
+        # The phone has a key of its own (made in plain Python: no signing library there), and holds no points yet.
+        shown = panel()["text"]
+        tag = shown.split("On team screens you are [")[1][:6]
+        assert all(c in "0123456789abcdef" for c in tag) and "Teaching points held: 0." in shown
+        assert any(f"[{tag}] (127.0.0.1)" in c["who"] for c in host.roster())    # the leader sees the same tag
+        assert "Teaching points this phone holds: 0. Press the button" in shown
+        assert ask(press("See my teaching points")["what"]) == ""
+        assert "Teaching points this phone holds: 0." in panel()["text"]
+        assert "this device holds 0" in ask("boost", {"points": 5})
         # A blind comparison on a trick question: two unlabelled answers, and the person says which was right.
         assert ask(press("Blind comparison: a trick question")["what"]) == ""
         assert wait_for(lambda: "Answer B:" in panel()["text"] or "could not be made" in panel()["text"], 90)
@@ -144,6 +153,12 @@ def test_the_app_leads_joins_shares_and_trains_further(model_dir, adapter, refer
         assert ask("settings", {"hidden": False}) == ""
         assert ask(press("Lead a team with no adapter")["what"]) == ""
         assert "You lead a team with no adapter" in panel()["text"]
+        # Whose teaching points the team takes is the leader's choice, and it is remembered.
+        assert "this team takes points from leaders whose teams its leader has signed on to" in panel()["text"]
+        choice = press("Take points from any leader")
+        assert ask(choice["what"], choice["req"]) == "" and "this team takes points from any leader" in panel()["text"]
+        choice = press("Take points from leaders whose teams I have signed on to")
+        assert ask(choice["what"], choice["req"]) == ""
         assert ask(press("End the team")["what"]) == ""
         teaching = press("Lead a teaching team")
         assert ask(teaching["what"], teaching["req"]) == "" and "You lead a teaching team" in panel()["text"]
@@ -165,7 +180,7 @@ def test_the_app_leads_joins_shares_and_trains_further(model_dir, adapter, refer
         asker = T.TeamLink(other, model=host.model, team=seen["team"], beat=0.3, want=[[0, 2]])
         asker.ask()
         assert wait_for(lambda: "asks to join" in panel()["text"], 10)
-        approve = press("Approve the device")
+        approve = press("Approve: A device [")
         assert ask(approve["what"], approve["req"]) == "" and asker.asked() == "approved"
         asker.join()
         assert not asker.use().plain and "Device 2" in panel()["text"]

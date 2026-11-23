@@ -86,6 +86,8 @@ class Trainer:
         from .peer import check_spec
         self.team = team                           # train inside a team: only its signed-on devices do the work
         self.node, self.ends = node, ends
+        from .. import identity
+        identity.of(node, work_dir)                # the key helpers will ask for their points receipts
         self.rank, self.alpha, self.targets = check_spec(rank, alpha, list(targets))
         self.scale = self.alpha / self.rank
         self.shapes = self._all_shapes()
@@ -189,6 +191,8 @@ class Trainer:
                    "rank": self.rank, "alpha": self.alpha, "targets": self.targets}
             if self.book is not None:
                 ask.update(run=self.book.run, ticket=self.book.ticket(replica.peer.node_id))
+                if getattr(self.node, "identity", None) is not None:
+                    ask["by"] = self.node.identity.key     # where the helper can ask for a points receipt later
             if self.team is not None:
                 ask["team"] = self.team
             ch.call(ask)

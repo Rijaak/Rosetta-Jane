@@ -240,7 +240,7 @@ class NumpyLayerServer:
         self._begin(state, "training", {"range": (x, y), "rank": rank, "scale": alpha / rank, "shapes": shapes,
                                         "adapters": None, "graph": None, "grads": None,
                                         "run": self.helped.note(header.get("run"), header.get("ticket"),
-                                                                self._node_id)})
+                                                                self._node_id, header.get("by"))})
         ch.send({"op": "t_open_ok", "variant": self.variant})
 
     def _t_adapters(self, ch: Channel, header: dict, tensor, state: dict) -> None:

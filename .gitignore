@@ -14,6 +14,11 @@ plan*.json
 *.jsonl
 peers.json
 device.key
+identity.json
+teaching-receipts.json
+teaching-points.json
+known-devices.json
+helped.json
 known-answers-*
 
 # Android build output and machine-specific settings

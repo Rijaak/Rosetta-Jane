@@ -60,6 +60,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from . import __version__
+from . import identity as ident
 from .lan.protocol import ProtocolError, RemoteError
 from .mobile import st
 from .mobile.peer import check_adapters, check_spec
@@ -72,7 +73,12 @@ JOINING_WORDS = {"open": "open: anyone in the group can sign on",
                  "ask": "ask to join: anyone in the group can ask, and the leader approves",
                  "invisible": "invisible: not listed; the team's code or an invitation is needed"}
 SETTINGS = "team-settings.json"
-DEFAULT_SETTINGS = {"joining": "open", "limit": 16, "hidden": False, "name": ""}
+DEFAULT_SETTINGS = {"joining": "open", "limit": 16, "hidden": False, "name": "", "honours": "teamed",
+                    "unconfirmed": True}
+HONOURS = ("teamed", "anyone", "mine")            # whose teaching points a leader's teams take (see points.py)
+HONOURS_WORDS = {"teamed": "points from leaders whose teams its leader has signed on to",
+                 "anyone": "points from any leader",
+                 "mine": "only points earned with its own leader"}
 MAX_REQUESTS = 32
 MIN_MARKS = 5                     # a community rating is not averaged in front of people on fewer marks than this
 # The community rating: several questions, each marked 1 (rarely) to 5 (nearly always), about what a
@@ -376,6 +382,13 @@ def fact_lines(desc: dict) -> List[str]:
         lines.append("Ratings are evidence, not proof: people tend to like being agreed with. The teacher rating "
                      "and the flattery check are measured; the community rating is opinion. None of them decides "
                      "how adapters are listed.")
+    leader = desc.get("leader") or {}
+    if in_team and (leader.get("name") or leader.get("key")):
+        about = desc.get("leader_about")
+        lines.append(f"Led by {ident.shown(leader.get('name', ''), leader.get('key', ''))}"
+                     + (f": {about}." if about else "."))
+    if in_team and desc.get("kind") == "session" and desc.get("honours") in HONOURS:
+        lines.append("Teaching points: this team takes " + HONOURS_WORDS[desc["honours"]] + ".")
     theirs = desc.get("version")
     if theirs and theirs != __version__:
         lines.append(f"The leader runs Rosetta-Jane {theirs}; this device runs {__version__}. "
@@ -486,8 +499,16 @@ def _send(node, addr: str, header: dict, timeout: float = 20.0):
 
 
 # -- the leader's settings, remembered for the next team ------------------------------------------------
-def check_settings(joining=None, limit=None, hidden=None, name=None) -> dict:
+def check_settings(joining=None, limit=None, hidden=None, name=None, honours=None, unconfirmed=None) -> dict:
     out = {}
+    if honours is not None:
+        if honours not in HONOURS:
+            raise ValueError("whose teaching points a team takes is one of: teamed, anyone, mine")
+        out["honours"] = honours
+    if unconfirmed is not None:
+        if not isinstance(unconfirmed, bool):
+            raise ValueError("'unconfirmed' must be true or false")
+        out["unconfirmed"] = unconfirmed
     if name is not None:
         from .net import clean_name
         if not isinstance(name, str):
@@ -514,7 +535,11 @@ def load_settings(work_dir: Optional[str]) -> dict:
     try:
         with open(os.path.join(work_dir or "", SETTINGS)) as f:
             read = json.load(f)
-        out.update(check_settings(read.get("joining"), read.get("limit"), read.get("hidden"), read.get("name")))
+        for key in DEFAULT_SETTINGS:                # one odd value does not throw the rest away
+            try:
+                out.update(check_settings(**{key: read.get(key)}))
+            except ValueError:
+                pass
     except (OSError, ValueError, AttributeError, TypeError):
         pass
     return out
@@ -539,7 +564,7 @@ class TeamHost:
                  alpha: Optional[float] = None, targets: Optional[List[str]] = None,
                  facts: Optional[dict] = None, code: Optional[str] = None, joining: str = "open",
                  limit: int = 16, model_name: Optional[str] = None, kind: str = "session",
-                 away_after: float = 20.0, gone_after: float = 90.0):
+                 away_after: float = 20.0, gone_after: float = 90.0, called: str = ""):
         """With no adapters the team has no adapter: it pools its devices to run the unchanged model.
         kind 'session' is a team that queries the model; 'teaching' is one that trains an adapter."""
         if kind not in KINDS:
@@ -547,7 +572,10 @@ class TeamHost:
         if kind == "teaching" and adapters:
             raise ValueError("a teaching team is not led with an adapter; start the training run from one instead")
         self.kind = kind
-        self.ledger = None                        # a helpers.Ledger: this leader's tally of teaching points
+        self.bank = None                          # a points.Bank: this leader's tally of teaching points
+        self.known = None                         # an identity.Known: the keys this device has teamed with
+        self.me = ident.of(node)                  # this device's own key
+        self.called = called                      # what the leader goes by on team screens
         self._boosts: Dict[str, list] = {}        # membership -> [(points, until)] spent for a larger share
         self._ever: set = set()                   # every membership this team has given out
         self._marks: Dict[str, dict] = {}         # community ratings: each membership's mark for each question
@@ -642,7 +670,9 @@ class TeamHost:
         return {"team": self.id, "kind": self.kind, "model": self.model, "model_name": self.model_name,
                 "layers": self.total, "adapter": self.adapter, "name": self.name, **spec,
                 "facts": self.facts, "begun": self.begun, "members": len(self._members) + 1,
-                "joining": self.joining, "limit": self.limit, "version": __version__}
+                "joining": self.joining, "limit": self.limit, "version": __version__,
+                "leader": {"name": self.called, **self.me.here("lead", self.id)},
+                "honours": self.bank.honours if self.bank is not None else "mine"}
 
     def _sweep(self) -> None:
         cutoff = time.time() - self.gone_after
@@ -658,10 +688,21 @@ class TeamHost:
             members = sorted(self._members.items(), key=lambda tm: tm[1]["joined"])
         for i, (token, m) in enumerate(members):
             state = "Away" if now - m["seen"] > self.away_after else ("In the team" if self.begun else "Ready")
-            cards.append({"who": f"{m['name']} ({m['ip']})" if m.get("name") else f"Device {i + 2} ({m['ip']})",
-                          "leader": False, "asks": m["asks"],
+            cards.append({"who": self._who(m, f"Device {i + 2}"), "key": m.get("key", ""),
+                          "about": self._about(m), "leader": False, "asks": m["asks"],
                           "serves": m["serves"], "state": state, "id": token[:8], "boost": self.boost_of(token)})
         return cards
+
+    @staticmethod
+    def _who(m: dict, fallback: str = "A device") -> str:
+        """A device as team screens name it: the name its owner chose, the tag of its key, and its address."""
+        return f"{ident.shown(m.get('name') or fallback, m.get('key', ''))} ({m['ip']})"
+
+    def _about(self, m: dict) -> str:
+        """A few words about a device, from what this one remembered when it arrived."""
+        if "about" not in m:
+            m["about"] = self.known.about(m.get("name", ""), m.get("key", "")) if self.known is not None else ""
+        return m["about"]
 
     def remove(self, card_id: str) -> None:
         """Take a device out of the team. It drops the adapter at its next check-in and cannot rejoin."""
@@ -680,8 +721,8 @@ class TeamHost:
         with self._lock:
             waiting = sorted(((t, a) for t, a in self._asks.items() if a["state"] == "waiting"),
                              key=lambda ta: ta[1]["at"])
-        return [{"id": t[:8], "who": f"{a['name']} ({a['ip']})" if a.get("name") else a["ip"], "asks": a["asks"],
-                 "serves": a["serves"], "waited": int(now - a["at"])} for t, a in waiting]
+        return [{"id": t[:8], "who": self._who(a), "key": a.get("key", ""), "about": self._about(a),
+                 "asks": a["asks"], "serves": a["serves"], "waited": int(now - a["at"])} for t, a in waiting]
 
     def _request(self, request_id: str) -> dict:
         with self._lock:
@@ -714,7 +755,11 @@ class TeamHost:
             if not peer.invites and peer.node_id not in here:
                 continue                           # its owner is invisible, or it shows nobody invitations
             serves = [s["layers"] for s in peer.services if s["model"] == self.model]
-            out.append({"addr": peer.addr, "name": peer.name, "serves": serves[0] if serves else None,
+            out.append({"addr": peer.addr, "name": peer.name, "key": peer.key,
+                        "who": ident.shown(peer.name, peer.key),
+                        "about": self.known.about(peer.name, peer.key) if self.known is not None and peer.key
+                        else "",
+                        "serves": serves[0] if serves else None,
                         "in_team": peer.node_id in here, "invited": peer.addr in invited, "busy": peer.busy})
         return out
 
@@ -823,6 +868,7 @@ class TeamHost:
                 token = secrets.token_hex(16)
                 from .net import clean_name
                 self._asks[token] = {"node": node_id, "ip": ip, "name": clean_name(header.get("name")),
+                                     "key": ident.proven(header.get("id"), "join", self.id, node_id),
                                      "asks": header.get("asks") is True,
                                      "serves": _range(header.get("serves"), self.total), "at": now,
                                      "state": "waiting", "pass": None}
@@ -865,9 +911,13 @@ class TeamHost:
             token = secrets.token_hex(16)
             self._ever.add(token)
             from .net import clean_name
+            key = ident.proven(header.get("id"), "join", self.id, node_id)
             self._members[token] = {"node": node_id, "ip": str(state.get("peer_ip", "")),
-                                    "name": clean_name(header.get("name")),
+                                    "name": clean_name(header.get("name")), "key": key,
                                     "asks": header.get("asks") is True, "serves": serves, "joined": now, "seen": now}
+            self._about(self._members[token])      # what this device knew of it before today
+        if self.known is not None and key:
+            self.known.note(key, clean_name(header.get("name")))
         ch.send({"op": "team_join_ok", "member": token, **self.describe()}, blob=self._use.blob(want))
 
     def _beat(self, ch, header: dict, tensor, state: dict) -> None:
@@ -899,39 +949,44 @@ class TeamHost:
                 raise Refused("only a member of the team can do that")
         return token
 
-    def _tally(self, token: str, tickets) -> dict:
+    def _tally(self, token: str) -> dict:
         from .helpers import BOOST_SECONDS
         now = time.time()
         with self._lock:
             in_force = self.boost_of(token)
             left = max((until - now for _, until in self._boosts.get(token, [])), default=0.0)
-        return {"balance": self.ledger.balance(tickets) if self.ledger is not None else 0, "boost": in_force,
-                "minutes": int(left // 60) if in_force else 0, "hour": int(BOOST_SECONDS // 60)}
+        return {"boost": in_force, "minutes": int(left // 60) if in_force else 0, "hour": int(BOOST_SECONDS // 60)}
 
     def _points(self, ch, header: dict, tensor, state: dict) -> None:
-        """How many teaching points a member has with this leader, and what share they have bought."""
+        """What share of the team's computing power a member has bought, and for how much longer."""
         token = self._member(header)
-        ch.send({"op": "team_points_ok", **self._tally(token, header.get("tickets"))})
+        ch.send({"op": "team_points_ok", **self._tally(token)})
 
     def _boost(self, ch, header: dict, tensor, state: dict) -> None:
-        """A member spends teaching points: each is 1% more of the team's computing power, for an hour."""
+        """A member spends teaching points: each is 1% more of the team's computing power, for an hour.
+        The points come as signed spends from receipts the member holds (see points.py)."""
         from .helpers import BOOST_SECONDS, MAX_BOOST
         token = self._member(header)
-        points = header.get("points")
+        spends = header.get("spends")
         if self.kind != "session":
             raise ValueError("points are spent in a team that queries the model, not in a teaching team")
-        if self.ledger is None:
-            raise ValueError("this leader keeps no tally of teaching points")
-        if isinstance(points, bool) or not isinstance(points, int) or points < 1:
+        if self.bank is None:
+            raise ValueError("this leader's device keeps no tally of teaching points")
+        asked = [p.get("spend", {}).get("amount") if isinstance(p, dict) and isinstance(p.get("spend"), dict)
+                 else None for p in spends] if isinstance(spends, list) else []
+        if not asked or any(isinstance(a, bool) or not isinstance(a, int) or a < 1 for a in asked):
             raise ValueError("spend a whole number of points, 1 or more")
         with self._lock:
-            if self.boost_of(token) + points > MAX_BOOST:
+            key = self._members[token].get("key", "") if token in self._members else ""
+            if self.boost_of(token) + sum(asked) > MAX_BOOST:
                 raise ValueError(f"at most {MAX_BOOST} points can be in force at once (a doubled share); "
                                  f"{self.boost_of(token)} are in force now")
-        self.ledger.spend(header.get("tickets"), points)
-        with self._lock:
-            self._boosts.setdefault(token, []).append((points, time.time() + BOOST_SECONDS))
-        ch.send({"op": "team_boost_ok", **self._tally(token, header.get("tickets"))})
+        got = self.bank.accept(key, spends, self.id)
+        if got["points"]:
+            with self._lock:
+                self._boosts.setdefault(token, []).append((got["points"], time.time() + BOOST_SECONDS))
+        ch.send({"op": "team_boost_ok", **self._tally(token), "spent": got["points"], "taken": got["taken"],
+                 "refused": got["refused"][:8]})
 
     def _check(self, ch, header: dict, tensor, state: dict) -> None:
         """A serving device in the team asks what weight a piece of work carries."""
@@ -992,6 +1047,13 @@ def _spans(layers: List[int]) -> str:
     return ", ".join(out)
 
 
+def _leader(raw, team_id: str) -> dict:
+    """Who a team's leader says they are. The key counts only if they signed for this team with it."""
+    from .net import clean_name
+    raw = raw if isinstance(raw, dict) else {}
+    return {"name": clean_name(raw.get("name")), "key": ident.proven(raw, "lead", team_id)}
+
+
 def _described(reply: dict, team_id: str) -> dict:
     """A leader's description of a team, checked field by field before anything is shown or used."""
     if reply.get("team") != team_id:
@@ -1016,7 +1078,9 @@ def _described(reply: dict, team_id: str) -> dict:
             **spec, "facts": clean_facts(reply.get("facts")) if adapter is not None else {},
             "begun": reply.get("begun") is True, "version": _text(reply.get("version"), 20),
             "members": whole(reply.get("members"), 0), "limit": whole(reply.get("limit"), MAX_MEMBERS),
-            "joining": reply.get("joining") if reply.get("joining") in JOINING else "invisible"}
+            "joining": reply.get("joining") if reply.get("joining") in JOINING else "invisible",
+            "leader": _leader(reply.get("leader"), team_id),
+            "honours": reply.get("honours") if reply.get("honours") in HONOURS else "mine"}
 
 
 def teams_in_group(node, model: Optional[str] = None, kind: Optional[str] = None) -> List[dict]:
@@ -1116,6 +1180,7 @@ class TeamLink:
                  patience: int = 4, find_wait: float = 15.0, on_end: Optional[Callable[[str], None]] = None,
                  called: str = ""):
         self.node, self.model, self.called = node, model, called
+        self.me = ident.of(node)                   # this device's own key: its name's tag, and its points
         self.code = self._key = None
         if code is not None:
             self.code = tidy(code)
@@ -1185,6 +1250,7 @@ class TeamLink:
             reply, _, _ = _send(self.node, self.leader, {"op": "team_ask", "team": self.id, "asks": self.asks,
                                                          "node": self.node.node_id, "serves": self.serves,
                                                          "name": self.called,
+                                                         "id": self.me.here("join", self.id, self.node.node_id),
                                                          **self._shown()})
         except RemoteError as e:
             raise (PermissionError if str(e).startswith("Refused") else NoTeam)(plain(e)) from None
@@ -1220,7 +1286,8 @@ class TeamLink:
             ch.sock.settimeout(300.0)
             reply, _, blob = ch.call({"op": "team_join", "team": self.id, "node": self.node.node_id,
                                       "asks": self.asks, "serves": self.serves, "want": want,
-                                      "name": self.called, **self._shown()})
+                                      "name": self.called,
+                                      "id": self.me.here("join", self.id, self.node.node_id), **self._shown()})
             try:
                 ch.send({"op": "bye"})
             except _NET:
@@ -1288,26 +1355,32 @@ class TeamLink:
             self._checked[(tag, proof)] = known
         return max(100, min(known[0], raised))
 
-    def _points(self, op: str, tickets: list, **more) -> dict:
+    def _points(self, op: str, **more) -> dict:
         if self.member is None or self.ended is not None:
             raise ValueError("only a member of the team can do that")
         try:
-            reply, _, _ = _send(self.node, self.leader, {"op": op, "team": self.id, "member": self.member,
-                                                         "tickets": tickets, **more}, timeout=20.0)
+            reply, _, _ = _send(self.node, self.leader, {"op": op, "team": self.id, "member": self.member, **more},
+                                timeout=60.0)
         except RemoteError as e:
             raise ValueError(plain(e)) from None
         except _NET:
             raise ValueError("the team's leader could not be reached") from None
         whole = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0   # noqa: E731
-        return {k: whole(reply.get(k)) for k in ("balance", "boost", "minutes", "hour")}
+        out = {k: whole(reply.get(k)) for k in ("boost", "minutes", "hour", "spent")}
+        out["taken"] = [t for t in reply.get("taken", []) if isinstance(t, dict)] \
+            if isinstance(reply.get("taken"), list) else []
+        out["refused"] = [str(r)[:200] for r in reply.get("refused", [])][:8] \
+            if isinstance(reply.get("refused"), list) else []
+        return out
 
-    def points(self, tickets: list) -> dict:
-        """This device's teaching points with the team's leader, and any share it has bought with them."""
-        return self._points("team_points", tickets)
+    def points(self) -> dict:
+        """The share of the team's computing power this device has bought, and for how much longer."""
+        return self._points("team_points")
 
-    def boost(self, tickets: list, points: int) -> dict:
-        """Spend teaching points: each is 1% more of the team's computing power for an hour."""
-        return self._points("team_boost", tickets, points=points)
+    def boost(self, spends: list) -> dict:
+        """Spend teaching points: each is 1% more of the team's computing power for an hour. `spends` are
+        signed spends from this device's receipts (points.Wallet.spends)."""
+        return self._points("team_boost", spends=spends)
 
     def rate(self, marks: Optional[dict] = None, blind: Optional[str] = None, trick: bool = False) -> None:
         """This person's part in the adapter's community rating: marks from 1 to 5 for any of QUESTIONS,
@@ -1486,9 +1559,17 @@ class TeamDesk:
         self.team = None                           # a TeamHost (this device leads) or a TeamLink (it signed on)
         self.pending: Optional[dict] = None        # a request to join that is waiting for a leader
         self.invitations = Invitations(node).attach()
-        self.hidden = load_settings(work_dir)["hidden"]
-        self.name = load_settings(work_dir)["name"]     # what this device's owner is called on team screens
+        kept = load_settings(work_dir)
+        self.hidden = kept["hidden"]
+        self.name = kept["name"]                   # what this device's owner is called on team screens
         self.invitations.closed = self.hidden
+        # This device's key, the keys it has teamed with, its receipts for teaching, and its tally as a leader.
+        from .points import Bank, Wallet
+        self.me = ident.of(node, work_dir)
+        self.known = ident.Known(work_dir)
+        self.wallet = Wallet(work_dir, self.me)
+        self.bank = Bank(node, work_dir, self.me, self.known, name_fn=lambda: self.name).attach()
+        self.bank.honours, self.bank.unconfirmed = kept["honours"], kept["unconfirmed"]
         node.presence = lambda: {"invites": not self.hidden, "name": self.name,
                                  "busy": self.team is not None and self.team.ended is None}
 
@@ -1500,7 +1581,20 @@ class TeamDesk:
         kept = load_settings(self.work_dir)
         if self.leading():
             kept.update(joining=self.team.joining, limit=self.team.limit)
-        return {**kept, "hidden": self.hidden, "name": self.name}
+        return {**kept, "hidden": self.hidden, "name": self.name, "honours": self.bank.honours,
+                "unconfirmed": self.bank.unconfirmed}
+
+    def who(self) -> dict:
+        """This device as team screens show it, and the teaching points it holds."""
+        return {"name": self.name, "key": self.me.key, "tag": self.me.tag, "shown": ident.shown(self.name, self.me.key),
+                "points": self.wallet.balance()}
+
+    def _noted(self, desc: dict) -> dict:
+        """A team's description with a few words about its leader, from what this device remembers."""
+        leader = desc.get("leader") or {}
+        if "leader_about" not in desc and (leader.get("name") or leader.get("key")):
+            desc = {**desc, "leader_about": self.known.about(leader.get("name", ""), leader.get("key", ""))}
+        return desc
 
     def use(self) -> Optional[TeamUse]:
         """The team to answer in right now, once it has begun. Otherwise none: the unchanged model, any peer."""
@@ -1526,7 +1620,7 @@ class TeamDesk:
                "questions": QUESTIONS,
                "joining": desc.get("joining"), "limit": desc.get("limit"),
                "members": desc.get("members") if leads else t.members,
-               "lines": fact_lines({**desc, "fits": True}),
+               "lines": fact_lines(self._noted({**desc, "fits": True})), "me": self.who(),
                "serving": bool(self.service is not None and t.id in self.service.teams())}
         if leads:
             out.update(roster=t.roster(), requests=t.requests(), missing=t.missing(own),
@@ -1621,11 +1715,10 @@ class TeamDesk:
         host = TeamHost(self.node, model=self.ends.fingerprint, total_layers=self.ends.num_layers, name=name,
                         adapters=found["adapters"], rank=found["rank"], alpha=found["alpha"],
                         targets=found["targets"], facts=found["facts"], code=code, joining=kept["joining"],
-                        limit=kept["limit"], model_name=self.model_name, kind=kind)
+                        limit=kept["limit"], model_name=self.model_name, kind=kind, called=self.name)
         if adapter_dir is not None:
             host.on_rating = lambda counts: self._rated(adapter_dir, host.id, counts)
-        from .helpers import Ledger
-        host.ledger = Ledger(self.work_dir)        # teaching points earned in this leader's training runs
+        host.bank, host.known = self.bank, self.known   # teaching points, and the keys this device has teamed with
         use = host.use()
         if not use.plain:
             self.ends.fit_team(use)
@@ -1640,7 +1733,8 @@ class TeamDesk:
             if s is not None:
                 s.leave_team(host.id)
             raise
-        save_settings(self.work_dir, {**kept, "hidden": self.hidden, "name": self.name})
+        save_settings(self.work_dir, {**kept, "hidden": self.hidden, "name": self.name,
+                                      "honours": self.bank.honours, "unconfirmed": self.bank.unconfirmed})
         self.team = host
         return host
 
@@ -1663,6 +1757,7 @@ class TeamDesk:
         desc = self._link(req, False).look()
         desc["fits"] = desc["model"] == self.ends.fingerprint
         desc["held_as"] = self._held(desc["adapter"])
+        desc = self._noted(desc)
         return {**desc, "lines": fact_lines(desc)}
 
     def join(self, req: dict) -> Optional[TeamLink]:
@@ -1723,6 +1818,10 @@ class TeamDesk:
             raise ValueError(f"signed off again: {e}") from None
         self.points = None
         self.invitations.drop(link.id)
+        leader = link.desc.get("leader") or {}
+        link.desc = self._noted(link.desc)         # what this device knew of the leader before today
+        if leader.get("key"):                      # signing on was this device's choice: remember whose team it was
+            self.known.note(leader["key"], leader.get("name", ""), led=True)
         return link
 
     def leave(self) -> None:
@@ -1766,7 +1865,7 @@ class TeamDesk:
             def shown(found):
                 out = []
                 for d in found:
-                    d = {**d, "fits": True, "held_as": self._held(d["adapter"])}
+                    d = self._noted({**d, "fits": True, "held_as": self._held(d["adapter"])})
                     out.append({**d, "lines": fact_lines(d)})
                 return out
             found = teams_in_group(self.node, fp)
@@ -1791,25 +1890,52 @@ class TeamDesk:
                 raise ValueError("no open team for this model in the group right now. Lead one yourself, "
                                  "or ask a leader for their code.")
         elif what == "settings":
-            change = check_settings(req.get("joining"), req.get("limit"), req.get("hidden"), req.get("name"))
+            change = check_settings(req.get("joining"), req.get("limit"), req.get("hidden"), req.get("name"),
+                                    req.get("honours"), req.get("unconfirmed"))
             if "hidden" in change:                 # this device's own: whether leaders see it to invite
                 self.hidden = self.invitations.closed = change.pop("hidden")
             if "name" in change:                   # and what its owner is called on team screens
                 self.name = change.pop("name")
+            if "honours" in change:                # whose teaching points this device's teams take
+                self.bank.honours = change.pop("honours")
+            if "unconfirmed" in change:
+                self.bank.unconfirmed = change.pop("unconfirmed")
             if change and t is not None and t.ended is None and not self.leading():
                 raise ValueError("in a team its leader chooses these for everyone")
             if change and self.leading():
                 change = t.set(**change)
             save_settings(self.work_dir, {**load_settings(self.work_dir), **change, "hidden": self.hidden,
-                                          "name": self.name})
+                                          "name": self.name, "honours": self.bank.honours,
+                                          "unconfirmed": self.bank.unconfirmed})
         elif what == "leave":
             self.leave()
         elif what in ("points", "boost"):          # teaching points: a larger share of the team's computing power
             if t is None or t.ended is not None or t.role == "leader":
                 raise ValueError("teaching points are spent by a member of a team, with that team's leader")
-            tickets = self.helped.tickets() if self.helped is not None else []
-            self.points = t.points(tickets) if what == "points" else t.boost(tickets, req.get("points"))
+            # Fetch receipts for this device's teaching from every leader in reach, this team's included.
+            self.wallet.claim(self.node, self.helped, also=t.leader)
+            if what == "points":
+                got = t.points()
+            else:
+                points, have = req.get("points"), self.wallet.balance()
+                if isinstance(points, bool) or not isinstance(points, int) or points < 1:
+                    raise ValueError("spend a whole number of points, 1 or more")
+                if have < points:
+                    raise ValueError(f"that takes {points} teaching points; this device holds {have}")
+                leader = (t.desc.get("leader") or {}).get("key", "")
+                got = t.boost(self.wallet.spends(points, t.id, prefer=leader))
+                self.wallet.took(got["taken"])
+                if got["spent"] < points:
+                    why = got["refused"][0] if got["refused"] else "the leader did not take them"
+                    if not got["spent"]:
+                        raise ValueError(f"no points were spent: {why}")
+                    got["note"] = f"{got['spent']} of {points} points were spent: {why}"
+            self.points = {**got, "balance": self.wallet.balance(), "from": self.wallet.rows()}
             return {"points": self.points, "team": self.report()}
+        elif what == "wallet":                     # the teaching points this device holds, in a team or not
+            self.wallet.claim(self.node, self.helped, also=t.leader if t is not None and t.role != "leader"
+                              and t.ended is None else None)
+            return {"me": self.who(), "from": self.wallet.rows()}
         elif what == "rate":                       # the community rating: a member's own mark, 1 to 5
             if t is None or t.role == "leader":
                 raise ValueError("community ratings come from the people who used the adapter in a team, "

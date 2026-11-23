@@ -68,6 +68,8 @@ class SwarmTrainer:
                  init: Optional[Dict[str, torch.Tensor]] = None, record_helpers: bool = True,
                  team: Optional[str] = None):
         self.node, self.ends = node, ends
+        from . import identity
+        identity.of(node, work_dir)                # the key helpers will ask for their points receipts
         self.team = team                          # train inside a team: only its signed-on devices do the work
         self.rank, self.alpha, self.targets = check_spec(rank, alpha, list(targets))
         self.scale = self.alpha / self.rank
@@ -195,6 +197,8 @@ class SwarmTrainer:
                    "rank": self.rank, "alpha": self.alpha, "targets": self.targets}
             if self.book is not None:
                 ask.update(run=self.book.run, ticket=self.book.ticket(peer.node_id))
+                if getattr(self.node, "identity", None) is not None:
+                    ask["by"] = self.node.identity.key     # where the helper can ask for a points receipt later
             if self.team is not None:
                 ask["team"] = self.team
             ch.call(ask)

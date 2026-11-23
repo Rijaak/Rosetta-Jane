@@ -58,6 +58,8 @@ def _run(model_dir, group_code, peers, layers, span, training, work_dir, port):
         os.makedirs(work_dir, exist_ok=True)
         node = Node(swarm_secret(group_code), f"0.0.0.0:{port}", bootstrap=[p for p in peers if p],
                     peers_file=os.path.join(work_dir, "peers.json"), quiet=True)
+        from rosetta_jane import identity
+        identity.of(node, work_dir)                # this phone's own key, kept with its other files
         node.handoffs = HandoffLog(os.path.join(work_dir, "handoffs.jsonl"), node.node_id)
         node.start()
         if layers == "auto":
@@ -719,7 +721,8 @@ def team_poll():
                                          f"serves layers {card['serves'][0]}-{card['serves'][1] - 1}"
                                          if card["serves"] else "",
                                          f"+{card['boost']}% share from teaching points" if card.get("boost") else "") if x)
-            lines.append(f"  {card['who']}: {card['state']}" + (f" ({role})" if role else ""))
+            lines.append(f"  {card['who']}: {card['state']}" + (f" ({role})" if role else "")
+                         + (f". {card['about'].capitalize()}." if card.get("about") else ""))
         if r["missing"]:
             lines.append(f"No signed-on device serves layers {r['missing'][0]}-{r['missing'][-1]} yet. Devices that "
                          "serve layers have to sign on too.")
@@ -728,22 +731,32 @@ def team_poll():
                          f"{r['missing_for_you'][0]}-{r['missing_for_you'][-1]}: a device does not route through "
                          "the layers it serves itself.")
         for q in r["requests"]:
-            lines.append(f"A device at {q['who']} asks to join.")
-            button(f"Approve the device at {q['who']}", "approve", {"request": q["id"]})
-            button(f"Decline the device at {q['who']}", "decline", {"request": q["id"]})
+            lines.append(f"{q['who']} asks to join." + (f" {q['about'].capitalize()}." if q.get("about") else ""))
+            button(f"Approve: {q['who']}", "approve", {"request": q["id"]})
+            button(f"Decline: {q['who']}", "decline", {"request": q["id"]})
         if not r["begun"] and r["kind"] == "session":
             button("Begin anyway" if r["missing"] else "Begin", "begin", {"force": bool(r["missing"])})
         for mode, label in (("open", "Let anyone in the group sign on"), ("ask", "People ask to join; I approve"),
                             ("invisible", "Invisible: code or invitation only")):
             if mode != r["joining"]:
                 button(label, "settings", {"joining": mode})
+        if r["kind"] == "session":             # whose teaching points this team takes: the leader's choice
+            from rosetta_jane.team import HONOURS, HONOURS_WORDS
+            now = desk.bank.honours
+            lines.append(f"Teaching points: this team takes {HONOURS_WORDS[now]}.")
+            labels = {"teamed": "Take points from leaders whose teams I have signed on to",
+                      "anyone": "Take points from any leader", "mine": "Take only points earned with me"}
+            for mode in HONOURS:
+                if mode != now:
+                    button(labels[mode], "settings", {"honours": mode})
         button("See who I can invite…", "devices")
         for d in _panel["devices"] or []:
             if not d["in_team"]:
                 what = f"serves layers {d['serves'][0]}-{d['serves'][1] - 1}" if d["serves"] else "not serving"
                 button(("Invited. Invite again: " if d["invited"] else "Invite ")
-                       + (f"{d['name']} at " if d.get("name") else "") + f"{d['addr']} ({what}"
-                       + (", in another team" if d.get("busy") else "") + ")", "invite", {"addr": d["addr"]})
+                       + (f"{d['who']} at " if d.get("who") else "") + f"{d['addr']} ({what}"
+                       + (", in another team" if d.get("busy") else "")
+                       + (f"; {d['about']}" if d.get("about") else "") + ")", "invite", {"addr": d["addr"]})
         for card in r["roster"]:
             if card.get("id"):
                 button(f"Remove {card['who']} from the team", "remove", {"member": card["id"]})
@@ -762,10 +775,18 @@ def team_poll():
         lines += r["lines"]
         if r["kind"] == "session":
             got = r["points"]
-            lines.append("Teaching points with this leader: " + ("press the button to see them." if got is None else
-                         f"{got['balance']}." + (f" In force: {got['boost']}, so your share of the team's computing "
-                                                 f"power is {100 + got['boost']} to everyone else's 100, for "
-                                                 f"{got['minutes']} more minutes." if got["boost"] else "")))
+            held = "" if got is None else ", ".join(f"{row['left']} from {row['from']}" for row in got["from"])
+            lines.append(f"Teaching points this phone holds: {r['me']['points']}" + (
+                ". Press the button to fetch any new ones." if got is None else
+                (f" ({held})" if held else "") + "." + (
+                    f" In force: {got['boost']}, so your share of the team's computing "
+                    f"power is {100 + got['boost']} to everyone else's 100, for "
+                    f"{got['minutes']} more minutes." if got["boost"] else "")))
+            if got is not None and got.get("note"):
+                lines.append(got["note"])
+            if got is not None and any(not t.get("confirmed") for t in got.get("taken", [])):
+                lines.append("Some of those points were taken without their own leader confirming them, because "
+                             "that leader is not in the group right now.")
             button("See my teaching points", "points")
             for spend in (5, 10, 25):
                 if got is not None and got["balance"] >= spend:
@@ -820,6 +841,9 @@ def team_poll():
                              f"{JOINING_WORDS[t['joining']]}.")
                 button(f"Look at \"{t['name']}\"", "look", {"team": t["team"]})
     if desk is not None:
+        me = desk.who()
+        lines += ["", f"On team screens you are {me['shown']}. The tag in brackets comes from this phone's own "
+                      f"key; the name is whatever you chose. Teaching points held: {me['points']}."]
         button("Invite lists: you are hidden. Press to be shown." if desk.hidden else
                "Invite lists: leaders can see this phone. Press to hide.", "settings", {"hidden": not desk.hidden})
     waiting_invites = len(desk.invitations._held) if desk is not None else 0

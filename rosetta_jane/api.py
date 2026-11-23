@@ -120,7 +120,7 @@ class Gateway:
                 "service": self.service_report(), "training": self.job.report() if self.job else None,
                 "adapters": self.adapters(), "adapter_details": self.adapter_details(),
                 "adapter_job": self.side.report() if self.side else None,
-                "team": self.team_report(), "team_settings": self.team_settings(),
+                "team": self.team_report(), "team_settings": self.team_settings(), "me": self.desk.who(),
                 "team_waiting": self.desk.waiting(),
                 "invitations": len(self.invitations._held),
                 "sharing": self.sharing.report(), "offers": self.sharing.offers()}

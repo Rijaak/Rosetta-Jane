@@ -19,6 +19,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from rosetta_jane import identity as ident
+from rosetta_jane import points as P
 from rosetta_jane import team as T
 from rosetta_jane.helpers import BOOK, HelpLog, RunBook, Sharing
 from rosetta_jane.lan.protocol import ProtocolError, RemoteError
@@ -256,18 +258,20 @@ def test_who_can_sign_on_is_the_leaders_choice_open_ask_or_invisible(model_dir, 
         with pytest.raises(PermissionError, match="ask to join"):
             join(team=host.id)
         asker = T.TeamLink(guest, model=fp, team=host.id, beat=0.2, called="Sam <b>the</b>\nTeacher")
+        tag = ident.of(guest).tag                       # made from the guest device's own key
         asker.ask()
         asker.ask()                                     # asking twice is one request
         assert asker.asked() == "waiting" and len(host.roster()) == 1
-        waiting = host.requests()                       # shown under the name they chose: a label, tidied, not checked
-        assert len(waiting) == 1 and waiting[0]["who"] == "Sam <b>the</b> Teacher (127.0.0.1)"
+        waiting = host.requests()                       # shown under the name they chose, tidied, with their key's tag
+        assert len(waiting) == 1 and waiting[0]["who"] == f"Sam <b>the</b> Teacher [{tag}] (127.0.0.1)"
+        assert waiting[0]["key"] == ident.of(guest).key
         with pytest.raises(PermissionError):
             asker.join()                                # asking is not being let in
         host.approve(waiting[0]["id"])
         assert host.requests() == [] and asker.asked() == "approved"
         asker.join()                                    # approved: in, and the adapter came with it
         assert asker.use() is not None and not asker.use().plain and len(host.roster()) == 2
-        assert host.roster()[1]["who"] == "Sam <b>the</b> Teacher (127.0.0.1)"
+        assert host.roster()[1]["who"] == f"Sam <b>the</b> Teacher [{tag}] (127.0.0.1)"
         with pytest.raises(ValueError, match="no longer waiting"):
             host.approve(waiting[0]["id"])
 
@@ -346,14 +350,20 @@ def test_who_can_sign_on_is_the_leaders_choice_open_ask_or_invisible(model_dir, 
 
 def test_the_leaders_choices_are_remembered_for_the_next_team(tmp_path):
     work = str(tmp_path)
-    assert T.load_settings(work) == {"joining": "open", "limit": 16, "hidden": False, "name": ""}
+    assert T.load_settings(work) == {"joining": "open", "limit": 16, "hidden": False, "name": "", "honours": "teamed", "unconfirmed": True}
     T.save_settings(work, {"joining": "invisible", "limit": 4, "hidden": True, "name": "Sam  the\nTeacher " + "x" * 40,
                            "something": "else"})
     assert T.load_settings(work) == {"joining": "invisible", "limit": 4, "hidden": True,
-                                     "name": "Sam the Teacher xxxxxxxx"}       # a short, one-line label
+                                     "name": "Sam the Teacher xxxxxxxx",       # a short, one-line label
+                                     "honours": "teamed", "unconfirmed": True}
+    T.save_settings(work, {**T.load_settings(work), "honours": "anyone", "unconfirmed": False})
+    assert (T.load_settings(work)["honours"], T.load_settings(work)["unconfirmed"]) == ("anyone", False)
+    with pytest.raises(ValueError, match="teamed, anyone, mine"):
+        T.check_settings(honours="everyone")
     with open(os.path.join(work, T.SETTINGS), "w") as f:
         f.write('{"joining": "whoever", "limit": 9999}')
-    assert T.load_settings(work) == {"joining": "open", "limit": 16, "hidden": False, "name": ""}    # nonsense is ignored
+    assert T.load_settings(work) == {"joining": "open", "limit": 16, "hidden": False, "name": "",
+                                     "honours": "teamed", "unconfirmed": True}    # nonsense is ignored
     assert T.tidy("daf-h2d") == "DAF H2D" and T.keys("daf h2d") == T.keys("DAF H2D")
     assert T.keys("DAF H2D")[0] != T.keys("DAF H2E")[0]
     for bad in ("DAF H2", "DAF H2O", "", None, "DAF H2DX"):                # O is not in the alphabet
@@ -725,6 +735,7 @@ def test_teaching_points_buy_a_larger_share_of_a_teams_computing_power(model_dir
     leader, idler = node(bootstrap=boot), node(bootstrap=boot)
     fp = model_fingerprint(model_dir)
     work = str(tmp_path / "work")                                   # the leader's work folder: runs and tally
+    ident.of(leader, work)                                          # a program loads its device's key first
     try:
         # A teaching session. The leader's device times the work it accepts from each helper.
         school = T.TeamHost(leader, model=fp, total_layers=8, kind="teaching").attach()
@@ -740,40 +751,67 @@ def test_teaching_points_buy_a_larger_share_of_a_teams_computing_power(model_dir
         school.end()
         teacher.leave_all()
 
-        # The tally is the leader's own, and answers only for the runs in that leader's work folder.
-        ledger = helpers.Ledger(work)
-        assert ledger.balance(tickets) == earned and ledger.balance([]) == 0
+        # The leader signs a receipt for the helper's points, made out to the helper's own key.
+        mine = ident.of(leader)
+        assert mine.path == os.path.join(work, ident.IDENTITY)      # the trainer's key is the one in its work folder
+        assert [x["by"] for x in tickets] == [mine.key]             # the helper noted whose teaching it was
+        bank = P.Bank(leader, work, mine, ident.Known(work), name_fn=lambda: "Ana").attach()
+        me1 = ident.of(n1, str(tmp_path / "h1"))
+        wallet = P.Wallet(str(tmp_path / "h1"), me1)
+        assert wallet.balance() == 0 and wallet.claim(n1, s1.helped) == 1 and wallet.balance() == earned
+        assert wallet.rows()[0]["from"] == f"Ana [{mine.tag}]" and wallet.rows()[0]["days"] == P.RECEIPT_DAYS - 1
+        assert P.Wallet(str(tmp_path / "h1"), me1).balance() == earned      # kept on disk
+        receipt = {k: v for k, v in wallet.receipts[wallet.rows()[0]["id"]].items() if k != "id"}
         forged = [{**tickets[0], "ticket": "0" * 32}, {**tickets[0], "as": n2.node_id}, {"run": "ab" * 8}, "junk"]
-        assert ledger.balance(forged) == 0 and helpers.Ledger(str(tmp_path / "elsewhere")).balance(tickets) == 0
-        assert ledger.balance(tickets + tickets) == earned          # a ticket shown twice counts once
-        with pytest.raises(ValueError, match="this device has"):
-            ledger.spend(tickets, earned + 1)
+        assert bank.issue(forged, me1.key) == [] and bank.issue([], me1.key) == []
+        assert len(bank.issue(tickets + tickets, me1.key)) == 1     # a ticket shown twice counts once
+        stranger = ident.Identity()
+        assert bank.issue(tickets, stranger.key) == []              # a copied ticket file gets nobody else the points
+        assert P.Bank(leader, str(tmp_path / "elsewhere"), mine).issue(tickets, me1.key) == []   # not that folder's run
+        for change in ({"points": receipt["points"] + 5}, {"to": stranger.key}, {"by": stranger.key}, {"name": "Bob"}):
+            with pytest.raises(ValueError, match="signature"):
+                P.check_receipt({**receipt, **change})              # altered after it was signed
+        assert not wallet.add({**receipt, "points": receipt["points"] + 5})
+        assert not P.Wallet(None, stranger).add(receipt)            # made out to someone else
+        with pytest.raises(ValueError, match="days old"):
+            P.check_receipt(receipt, now=clock.time() + (P.RECEIPT_DAYS + 1) * 86400)
 
         # A team for querying, led by the same leader. The teacher is a member, and so is someone who never taught.
         leader.team_host = None
-        host = T.TeamHost(leader, model=fp, total_layers=8, joining="open")
-        host.ledger = ledger
+        host = T.TeamHost(leader, model=fp, total_layers=8, joining="open", called="Ana")
+        host.bank = bank
         host.attach()
         serving_member = signed_on(n2, s2, team=host.id, leader=addr(leader))
         serving_link = serving_member.links[host.id]
         serving_link.beat = 0.2
         taught = T.TeamLink(n1, model=fp, team=host.id, leader=addr(leader), beat=0.2).join()
         other = T.TeamLink(idler, model=fp, team=host.id, leader=addr(leader), beat=0.2).join()
+        assert taught.desc["leader"] == {"name": "Ana", "key": mine.key}    # the leader signed for this team
         host.begin(2)
         assert wait_for(lambda: taught.active() and other.active())
-        assert taught.points(tickets) == {"balance": earned, "boost": 0, "minutes": 0, "hour": 60}
-        assert other.points([]) == {"balance": 0, "boost": 0, "minutes": 0, "hour": 60}
-        with pytest.raises(ValueError, match="this device has 0"):
-            other.boost([], 1)                                      # no teaching, no points
-        with pytest.raises(ValueError, match="this device has 0"):
-            other.boost(forged, 1)
+        nothing = {"boost": 0, "minutes": 0, "hour": 60, "spent": 0, "taken": [], "refused": []}
+        assert taught.points() == nothing and other.points() == nothing
         with pytest.raises(ValueError, match="whole number"):
-            taught.boost(tickets, 0)
-        got = taught.boost(tickets, 3)                              # 3 points: 3% more, for an hour
-        assert got == {"balance": earned - 3, "boost": 3, "minutes": 59, "hour": 60}
-        assert ledger.balance(tickets) == earned - 3 and helpers.Ledger(work).balance(tickets) == earned - 3
+            other.boost([])                                         # no teaching, no points
+        # Someone else's receipt is no use: only the device it was made out to can sign a spend from it.
+        theirs = ident.of(idler)
+        stolen = [{"receipt": receipt, "spend": P.make_spend(theirs, {**receipt, "id": ""}, 1, host.id)}]
+        stolen[0]["spend"]["receipt"] = wallet.rows()[0]["id"]
+        got = other.boost(stolen)
+        assert got["spent"] == 0 and "different device" in got["refused"][0]
+        spends = wallet.spends(3, host.id, prefer=mine.key)         # 3 points: 3% more, for an hour
+        assert [x["spend"]["amount"] for x in spends] == [3]
+        got = taught.boost(spends)
+        assert (got["spent"], got["boost"], got["minutes"], got["refused"]) == (3, 3, 59, [])
+        assert got["taken"][0]["confirmed"] is True and got["taken"][0]["from"] == f"Ana [{mine.tag}]"
+        wallet.took(got["taken"])
+        assert wallet.balance() == earned - 3
+        again = taught.boost(spends)                                # the same signed spend, sent twice
+        assert again["spent"] == 0 and "already used" in again["refused"][0] and again["boost"] == 3
+        # The leader's tally is kept in their work folder: a fresh look at it agrees.
+        assert P.Bank(leader, work, mine).issue(tickets, me1.key)[0]["left"] == earned - 3
         with pytest.raises(ValueError, match="at most 100 points"):
-            taught.boost(tickets, 98)
+            taught.boost(wallet.spends(1, host.id) * 98)
         assert [c["boost"] for c in host.roster() if c.get("id")] .count(3) == 1
 
         # Each serving device in the team shares its time out by weight: 103 for the teacher, 100 for the others.
@@ -797,16 +835,16 @@ def test_teaching_points_buy_a_larger_share_of_a_teams_computing_power(model_dir
         # An hour later the points have run out; spent points do not come back.
         host._boosts[taught.member] = [(3, clock.time() - 1)]
         assert host.boost_of(taught.member) == 0 and host.weights() == {}
-        assert taught.points(tickets)["balance"] == earned - 3
+        assert taught.points()["boost"] == 0 and wallet.balance() == earned - 3
         # Points are not spent in a teaching team: it does not query.
         host.end()
         leader.team_host = None
         again = T.TeamHost(leader, model=fp, total_layers=8, kind="teaching", joining="open")
-        again.ledger = ledger
+        again.bank = bank
         again.attach()
         pupil = T.TeamLink(n1, model=fp, team=again.id, leader=addr(leader), beat=0.2).join()
         with pytest.raises(ValueError, match="not in a teaching team"):
-            pupil.boost(tickets, 1)
+            pupil.boost(wallet.spends(1, again.id))
     finally:
         stop([hub, n1, n2, leader, idler])
 
@@ -982,9 +1020,13 @@ def test_a_front_end_can_run_a_team_from_start_to_finish(model_dir, adapter, ref
 
         # Teaching points: this device never taught for this leader, so it has none to spend.
         status, body = call(join_at, "/api/rosetta/team/points", {}, join_tok)
-        assert status == 200 and body["points"] == {"balance": 0, "boost": 0, "minutes": 0, "hour": 60}
+        assert status == 200 and body["points"] == {"balance": 0, "from": [], "boost": 0, "minutes": 0, "hour": 60,
+                                                    "spent": 0, "taken": [], "refused": []}
         status, body = call(join_at, "/api/rosetta/team/boost", {"points": 5}, join_tok)
-        assert status == 400 and "this device has 0" in body["error"]
+        assert status == 400 and "this device holds 0" in body["error"]
+        status, body = call(join_at, "/api/rosetta/team/wallet", {}, join_tok)
+        assert status == 200 and body["me"]["points"] == 0 and len(body["me"]["tag"]) == 6
+        assert body["me"]["shown"] == f"[{body['me']['tag']}]"          # no name chosen: the tag alone
         assert call(lead_at, "/api/rosetta/team/points", {}, lead_tok)[0] == 400
 
         # The community rating: a member's own mark for the adapter, kept apart from the teacher rating.
@@ -1034,7 +1076,8 @@ def test_a_front_end_can_run_a_team_from_start_to_finish(model_dir, adapter, ref
 
         # The leader opens the team: a serving device whose owner allowed open teams signs on by itself.
         status, body = call(lead_at, "/api/rosetta/team/settings", {"joining": "open", "limit": 8}, lead_tok)
-        assert status == 200 and body["team_settings"] == {"joining": "open", "limit": 8, "hidden": False, "name": ""}
+        assert status == 200 and body["team_settings"] == {"joining": "open", "limit": 8, "hidden": False, "name": "",
+                                                           "honours": "teamed", "unconfirmed": True}
         assert wait_for(lambda: s3.teams() == [mine["team"]], 20)
         assert wait_for(lambda: len(team(lead_at)["roster"]) == 3 and team(lead_at)["missing_for_you"] == [])
         assert wait_for(lambda: any(mine["team"] in s["teams"] for p in nodes[0].table.peers() for s in p.services))
@@ -1089,7 +1132,7 @@ def test_a_front_end_can_run_a_team_from_start_to_finish(model_dir, adapter, ref
         assert answer(join_g) == (plain, None) and answer(lead_g) == (plain, None)
         # The leader's choices are the starting point for their next team.
         assert call(lead_at, "/api/rosetta/status")[1]["team_settings"] == \
-            {"joining": "ask", "limit": 8, "hidden": False, "name": ""}
+            {"joining": "ask", "limit": 8, "hidden": False, "name": "", "honours": "teamed", "unconfirmed": True}
         status, body = call(lead_at, "/api/rosetta/team/create", {"name": "field-notes"}, lead_tok)
         assert status == 200 and body["team"]["joining"] == "ask" and body["team"]["limit"] == 8
         assert body["team"]["code"] != mine["code"]                   # a new team, a new code
@@ -1292,13 +1335,29 @@ def test_command_line_teams_sharing_and_training_further(model_dir, adapter, wit
         lead.type("ask")
         lead.until("ask to join: anyone in the group can ask, and the leader approves. Remembered")
         join.close()
-        join = Typing(["team", "join", *asking, "--yes", "--temperature", "0", "--work-dir", str(tmp_path / "j2")], env)
+        join = Typing(["team", "join", *asking, "--yes", "--temperature", "0", "--work-dir", str(tmp_path / "j2"),
+                       "--called", "Sam"], env)
         join.until("Asked. Waiting for the leader to approve.")
-        lead.until("asks to join. Type: approve ")
+        # The request shows the name the person chose with the tag of their device's key.
+        lead.until("asks to join (new to this device). Type: approve ")
+        tag = re.search(r"\[team\] Sam \[([0-9a-f]{6})\] \(127\.0\.0\.1\) asks to join", lead.said).group(1)
         lead.type("approve " + re.search(r"Type: approve ([0-9a-f]{8})", lead.said).group(1))
         join.until("Signed on. The team has begun.")
+        join.until(f"On team screens you are Sam [{tag}].")           # the same tag on their own screen
+        with open(tmp_path / "j2" / "identity.json") as f:           # ...from the key kept in their work folder
+            assert ident.tag(ident._sign.public_key(bytes.fromhex(json.load(f)["secret"])).hex()) == tag
         join.type("w3 w9 w20")
         join.until("[with the adapter \"field-notes\"")
+        join.type("points")                                          # nothing earned yet
+        join.until("Teaching points this device holds: 0. None in force.")
+        join.type("boost 2")
+        join.until("that takes 2 teaching points; this device holds 0")
+        lead.type("honour anyone")
+        lead.until("This team now takes points from any leader. Remembered for your next team.")
+        lead.type("honour everyone")
+        lead.until("whose teaching points a team takes is one of: teamed, anyone, mine")
+        lead.type("honour teamed")
+        lead.until("This team now takes points from leaders whose teams its leader has signed on to.")
         join.type("rate")
         for _ in range(3):
             join.type("5")
